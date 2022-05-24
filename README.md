@@ -206,7 +206,7 @@ we might want to explore custom loss gradients.
 So first we write it in jaxpr-like form
 ```python
 def loss0(W, x, l):
-    ((W1,b1),(W2,b2)) = W  # All FP16, say
+    ((W1,b1),(W2,b2)) = W
     s1 = mm(W1, x)
     t1 = add(s1, b1)
     y1 = relu(t1)
