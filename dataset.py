@@ -1,3 +1,5 @@
+# Adapted from https://github.com/vpj/jax_transformer
+
 from pathlib import Path
 from labml.utils.download import download_file
 

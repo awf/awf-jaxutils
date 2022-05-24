@@ -1,3 +1,4 @@
+# Adapted from https://github.com/vpj/jax_transformer
 
 from typing import Dict, NamedTuple, Tuple
 
