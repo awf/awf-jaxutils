@@ -1,5 +1,5 @@
 import argparse
-from typing import Any
+from typing import Any, Dict
 import sys
 
 class Arg:
@@ -24,19 +24,23 @@ class Arg:
         Arg.str()
     which can be useful for experiment names
     """
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(add_help=False)
     parsed_args = None
-    parsed_args_at = None
-    all_args = {}
+    parsed_args_at : int = -1
+    all_args : Dict[str, 'Arg']= {}
+
     _default_sentinel = object()
 
     def __init__(self, flag : str, default : Any, doc: str=''):
         if flag in Arg.all_args:
             raise Exception(f'Flag {flag} used multiple times.')
+
         self.flag = flag
         self.default = default
         self.override = None
+
         Arg.all_args[flag] = self
+
         if isinstance(default, bool) and default == False:
             Arg.parser.add_argument('-'+flag, help=doc, 
                             default=Arg._default_sentinel, action='store_true', dest=flag)
@@ -74,8 +78,10 @@ class Arg:
         if not argv:
             argv = sys.argv[1:]
 
-        newhash = hash('/'.join(sorted(cls.all_args.keys())))
+        newhash = hash(tuple(sorted(cls.all_args.keys())))
         if not cls.parsed_args or cls.parsed_args_at != newhash:
+            if not cls.parsed_args:
+                cls.parser.add_argument('-help', action='help', help='Print this help')
             cls.parsed_args = cls.parser.parse_args(argv)
             cls.parsed_args_at = newhash
         return cls.parsed_args
