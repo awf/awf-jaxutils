@@ -1,0 +1,15 @@
+[tool.black]
+line-length = 88
+include = '\.pyi?$'
+
+# pyproject.toml
+[tool.pytest.ini_options]
+minversion = "6.0"
+# addopts = "-ra -q"
+testpaths = [
+    ".",
+]
+python_files = [
+    "vjp.py",
+    "test_Arg.py"
+]
