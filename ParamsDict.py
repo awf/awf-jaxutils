@@ -27,9 +27,9 @@ class ParamsDict(types.SimpleNamespace):
         # Should overload setattr to warn if setattr is called after hash has been computed
         return hash(tuple(hash(x) for (_,x) in self.__dict__.items()))
 
-    def print(self, path):
+    def print(self, path = ''):
         for (k,v) in self.items(path):
-            print(k,v)
+            print(k + ':',v)
 
     @classmethod
     def labels_aux(cls, path, obj):
