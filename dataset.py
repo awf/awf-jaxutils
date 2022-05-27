@@ -6,6 +6,7 @@ from labml.utils.download import download_file
 import jax
 import jax.numpy as jnp
 
+
 class TinyShakespeare:
     """
     ## Tiny Shakespeare dataset
@@ -17,20 +18,20 @@ class TinyShakespeare:
         * `seq_len` is the sequence length of a sample
         * `batch_size` is the batch size
         """
-        print('Dataset init')
+        print("Dataset init")
         self.batch_size = batch_size
         # PRNG key for shuffling the samples
         _, self.rnd_key = jax.random.split(rnd_key)
 
         # Local path of the text file
-        path = Path('/tmp/tiny_shakespeare.txt')
+        path = Path("/tmp/tiny_shakespeare.txt")
         # Download if it doesn't exist
-        url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
+        url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
         if not path.exists():
             download_file(url, path)
 
         # Read the file
-        with open(str(path), 'r') as f:
+        with open(str(path), "r") as f:
             self.text = f.read()
 
         # Get the characters/tokens
@@ -48,12 +49,12 @@ class TinyShakespeare:
         # Number of batches
         self.n_batches = len(data) // (seq_len * batch_size)
         # Truncate
-        data = data[:self.n_batches * seq_len * batch_size]
+        data = data[: self.n_batches * seq_len * batch_size]
         # Reshape into a samples (better to use random offsets, but lets ignore that here)
         self.data = data.reshape((-1, seq_len))
         # List of sample indexes
         self.idx = jnp.arange(len(self.data))
-        print('Dataset outit')
+        print("Dataset outit")
 
     def __iter__(self):
         """
@@ -85,7 +86,9 @@ class TinyShakespeare:
             raise StopIteration()
 
         # Sample indexes for the batch
-        idx = self.idx[self._iter_idx * self.batch_size:(self._iter_idx + 1) * self.batch_size]
+        idx = self.idx[
+            self._iter_idx * self.batch_size : (self._iter_idx + 1) * self.batch_size
+        ]
         # Increment iteration step
         self._iter_idx += 1
 
