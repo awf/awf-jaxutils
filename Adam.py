@@ -7,10 +7,12 @@ import jax.numpy as jnp
 
 from functools import partial
 
+
 class AdamState(NamedTuple):
     """
     This is a named tuple for storing Adam optimizer state for a parameter
     """
+
     m: jnp.ndarray
     v: jnp.ndarray
 
@@ -41,9 +43,13 @@ class Adam:
     that acts against variance in gradients.
     """
 
-    def __init__(self, params: Dict,
-                 lr: float = 0.001, betas: Tuple[float, float] = (0.9, 0.999),
-                 eps: float = 1e-16, ):
+    def __init__(
+        self,
+        params: Dict,
+        lr: float = 0.001,
+        betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-16,
+    ):
         """
         * `params` is the tree-map of parameters
         * `lr` is the learning rate $\alpha$
@@ -93,14 +99,14 @@ class Adam:
         """
 
         # Bias corrections for $\hat{m}_t$: $1 - \beta_1^t$ and for $\hat{v}_t$: $1 - \beta_2^t$
-        bias_correction = [1 - beta ** n_steps for beta in self.betas]
+        bias_correction = [1 - beta**n_steps for beta in self.betas]
         # Uncorrected first and second moments $m_t$ and $v_t$
         m, v = state
 
         # $\alpha \frac{\sqrt{1-\beta_2^t}}{1-\beta_1^t}$
         step_size = self.lr * (bias_correction[1] ** 0.5) / bias_correction[0]
         # $\sqrt{v_t} + \hat{\epsilon}$
-        den = (v ** 0.5) + self.eps
+        den = (v**0.5) + self.eps
 
         # $\theta_t \leftarrow \theta_{t-1} - \alpha \frac{\sqrt{1-\beta_2^t}}{1-\beta_1^t} \cdot
         #  \frac{m_t}{\sqrt{v_t} + \hat{\epsilon}}$
@@ -118,7 +124,7 @@ class Adam:
         # $$m_t \leftarrow \beta_1 m_{t-1} + (1 - \beta_1) \cdot g_t$$
         m = self.betas[0] * m + grad * (1 - self.betas[0])
         # $$v_t \leftarrow \beta_2 v_{t-1} + (1 - \beta_2) \cdot g_t^2$$
-        v = self.betas[1] * v + (grad ** 2) * (1 - self.betas[1])
+        v = self.betas[1] * v + (grad**2) * (1 - self.betas[1])
 
         # Return the new state
         return AdamState(m, v)
