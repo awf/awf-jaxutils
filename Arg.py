@@ -10,7 +10,8 @@ class Arg:
     Declare parameters anywhere in the program, and refer to them when needed.
 
     ```
-    lr = Arg('lr', 'Learning rate', default=0.001)
+    lr = Arg('lr', 0.001, 'Learning rate')
+    opt = Arg('opt', doc='Optimizer', default='sgd', choices=('adam','sgd'))
     ```
 
     And some time later, use `lr()` in code
@@ -18,12 +19,12 @@ class Arg:
     optimizer = SGD(stepsize = lr())
     ```
 
-    If `sys.argv` has not been parsed at that poinr, or if its last parse was before `lr` was
+    If `sys.argv` has not been parsed at that point, or if its last parse was before `lr` was
     declared, it will be re-parsed.
 
     You can also summarize the changes from default using
         Arg.str()
-    which can be useful for experiment names
+    which can be useful for experiment names.
     """
 
     parser = argparse.ArgumentParser(add_help=False)
@@ -33,7 +34,7 @@ class Arg:
 
     _default_sentinel = object()
 
-    def __init__(self, flag: str, default: Any, doc: str = "", dtype=None):
+    def __init__(self, flag: str, default: Any, doc: str = "", dtype=None, **kwargs):
         if flag in Arg.all_args:
             raise Exception(f"Flag {flag} used multiple times.")
 
