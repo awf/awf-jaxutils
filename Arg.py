@@ -7,6 +7,8 @@ class Arg:
     """
     Convenient 'distributed' interface to argparse.
 
+    (See https://github.com/awf/awf-jaxutils#arg for more documentation.)
+
     Declare parameters anywhere in the program, and refer to them when needed.
 
     ```
