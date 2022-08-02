@@ -1,0 +1,5 @@
+jax
+jaxlib
+astpretty
+icecream
+labml
