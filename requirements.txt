@@ -3,3 +3,5 @@ jaxlib
 astpretty
 icecream
 labml
+pytest
+black
