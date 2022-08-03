@@ -68,25 +68,18 @@ def get_ast_for_function(f):
     return ast.parse(dedent_src, filename=filename)
 
 
-# TODO remove
-class AnnotsToCommentsVisitor(ast.NodeTransformer):
-    def visit_AnnAssign(self, node):
-        node2 = ast.Assign([node.target], node.value, str(node.annotation))
-        return ast.copy_location(node2, node)
-
-
 class TypeCheckVisitor(ast.NodeTransformer):
     def visit_FunctionDef(self, node):
         """
         Remove 'typecheck' decorator
         Change name to '<name>_checked'
         """
-        # name is a raw string of the function name.
-        # args is a arguments node.
-        # body is the list of nodes inside the function.
-        # decorator_list is the list of decorators to be applied, stored outermost first (i.e. the first in the list will be applied last).
-        # returns is the return annotation (Python 3 only).
-        # type_comment is optional. It is a string containing the PEP 484 type comment of the function (added in Python 3.8)
+        # node.name : raw string of the function name.
+        # node.args : arguments node.
+        # node.body : list of nodes inside the function.
+        # node.decorator_list : list of decorators to be applied, stored outermost first (i.e. the first in the list will be applied last).
+        # node.returns : the return annotation (Python 3 only).
+        # node.type_comment : optional string containing the PEP 484 type comment of the function (added in Python 3.8)
         node = self.generic_visit(node)
         new_decorator_list = [
             dec
@@ -105,21 +98,12 @@ class TypeCheckVisitor(ast.NodeTransformer):
         return new_node
 
     def visit_AnnAssign(self, node):
-        """
-        Replace
-          x : T = e
-        With
-          x : T = e
-          assert isinstance(x, T), "x is not a T"
-          TODO:           if not isinstance(x, T): raise TypeError("x is not a T")
-
-        """
         # An assignment with a type annotation.
-        # mode.target is a single node and can be a Name, a Attribute or a Subscript.
-        # annotation is the annotation, such as a Str or Name node.
-        # value is a single optional node.
-        # simple is True for a Name node in target that do not appear in
-        #   between parenthesis and are hence pure names and not expressions.
+        # node.target : single node and can be a Name, a Attribute or a Subscript.
+        # node.annotation : annotation, such as a Str or Name node.
+        # node.value : single optional node.
+        # node.simple : True for a Name node in target that do not appear between
+        #               parentheses and are hence pure names and not expressions.
 
         if not node.simple:
             return node
@@ -146,7 +130,52 @@ class TypeCheckVisitor(ast.NodeTransformer):
         return [node, node_assert]
 
 
-def typecheck(f, show_src=True):
+def typecheck(f, show_src=False):
+    """
+    Decorator which turns annotated assignments of the form
+      x : T = e
+    into
+      x : T = e
+      assert isinstance(x, T), "x is not a T"
+
+    EXAMPLE:
+
+      def foo(x : int, y : float):
+        z : int = x * y # This should error
+        w : float = z * 3.2
+        return w
+
+      @typecheck
+      def foo(x : int, y : float):
+        z : int = x * y # Now it does
+        w : float = z * 3.2
+        return w
+
+    OPERATION:
+
+    This works by AST transformation, replacing the function foo above
+    with the function
+
+      def foo(x : int, y : float):
+        z : int = x * y
+        assert isinstance(z, int)
+        w : float = z * 3.2
+        assert isinstance(w, float)
+        return w
+
+    If you want to actually see the transformed code, call with show_src=True
+
+      @functools.partial(typecheck, show_src=True)
+      def foo(x : int, y : float):
+        z : int = x * y # Now it does
+        w : float = z * 3.2
+        return w
+
+    """
+
+    # TODO:
+    #   if not isinstance(x, T): raise TypeError("x is not a T")
+
     node = get_ast_for_function(f)
     new_node = TypeCheckVisitor().visit(node)
 
