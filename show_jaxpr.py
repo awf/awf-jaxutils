@@ -218,12 +218,20 @@ if __name__ == '__main__':
     )
 
 
-def show_xla(f, args, file=sys.stdout, **kwargs):
+def show_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
     """
     Show XLA for f, using template args
     """
     xla = jax.xla_computation(f, **kwargs)(*args)
     print("XLA=", xla.as_hlo_text(), file=file)
+
+    if optimized:
+        e = jax.lib.xla_bridge.get_backend().compile(xla)
+        module = e.hlo_modules()[0]
+    else:
+        module = xla.get_hlo_module()
+    option = xla_ext.HloPrintOptions.short_parsable()
+    print(module.to_string(option), file=file)
 
 
 def show_jaxpr_and_xla(f, args, file=sys.stdout, **kwargs):
@@ -231,7 +239,8 @@ def show_jaxpr_and_xla(f, args, file=sys.stdout, **kwargs):
     show_xla(f, args, file=file, **kwargs)
 
 
-if __name__ == "__main__":
+def test_roundtrip():
+    import os
 
     def foo(p, x, q):
         x = jax.numpy.matmul(x, p * x.T)
@@ -244,14 +253,14 @@ if __name__ == "__main__":
 
     prng = jax.random.PRNGKey(42)
     args = (2.2, jax.random.normal(prng, (3, 2, 5)), "q")
+
+    print("f(args)=")
     print(f(*args))
 
     # Save to file
     fn = "tmp/show_jaxpr_jaxpr.py"
     with open(fn, "w") as file:
         show_jaxpr(f, args, name="f", file=file)
-
-    import os
 
     os.system(f"black {fn}")
 
@@ -265,7 +274,7 @@ if __name__ == "__main__":
     spec.loader.exec_module(module)
 
     # Check rountrip: does module.f give the same result?
-    print(module.f(*args) - f(*args))
+    assert jnp.allclose(module.f(*args), f(*args))
 
     # Save again
     fn2 = "tmp/show_jaxpr_roundtrip.py"
@@ -274,15 +283,14 @@ if __name__ == "__main__":
 
     os.system(f"black {fn2}")
 
-    # Could diff fn and fn2 now.
-
-    # Reload for 2nd roundtrip
+    # Reload for 2nd roundtrip to test string equality
     module_name = "show_jaxpr_roundtrip2"
     spec = importlib.util.spec_from_file_location(module_name, fn2)
     module2 = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module2
     spec.loader.exec_module(module2)
-    print(module2.f(*args) - f(*args))
+
+    assert jnp.allclose(module.f(*args), f(*args))
 
     # Sand save 2nd roundtrip
     fn3 = "tmp/show_jaxpr_roundtrip2.py"
@@ -290,3 +298,5 @@ if __name__ == "__main__":
         show_jaxpr(module2.f, args, file=file3)
 
     os.system(f"black {fn3}")
+
+    print(f"code --diff {fn2} {fn3} # Do view diffs in vs code")
