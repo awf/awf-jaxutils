@@ -176,7 +176,7 @@ def mm_scaled(A, B, sA, sB):
     return C
 
 
-def mm_scaled_vjp(A, B, sA, sB, dC) -> Tuple[F16, F16, F16, F16]:
+def mm_scaled_vjp(A, B, sA, sB, dC):
     AB = mm(A, B)
     sC = sA * sB
     C = scale(sC, AB)
@@ -199,7 +199,7 @@ def test_mm_scaled():
     )
 
 
-def mm_scaledopt_vjp(A, B, sA, sB, dC) -> Tuple[F16, F16, F16, F16]:
+def mm_scaledopt_vjp(A, B, sA, sB, dC):
     s = sA * sB
 
     dA = s * mm(dC, B.T)
