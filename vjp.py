@@ -23,6 +23,7 @@ def tree_close(tref, ttest, rtol, atol, verbose=True):
 def tree_all(t):
     return all(jax.tree_util.tree_leaves(t))
 
+
 def tree_allclose(tref, ttest, rtol, atol, verbose=True):
     return tree_all(tree_close(tref, ttest, rtol, atol, verbose))
 
@@ -160,48 +161,68 @@ def test_dotall():
     check(dotall, dotall_vjp, np.random.randn(13, 7), np.random.randn(13, 7))
 
 
-# mm8
-F8 = None
-F16 = None
-from typing import Tuple
+def mm_scaled(A, B, sA, sB):
+    """
+    Take matrices A and B, with associated scale factors sA, sB,
+    and compute (sA * A) @ (sB * B) = (sA * sB) * (A @ B)
+
+      C = mm(scale(sA, A), scale(sB, B))
+      C = scale(sA*sB, mm(A, B))
+
+    """
+
+    AB = mm(A, B)
+    C = scale(sA * sB, AB)
+    return C
 
 
-def mm8(A: F8, B: F8, sA: F16, sB: F16) -> F16:
-    sAA = scale(sA, A)
-    sBB = scale(sB, B)
-    return mm(sAA, sBB)
+def mm_scaled_vjp(A, B, sA, sB, dC) -> Tuple[F16, F16, F16, F16]:
+    AB = mm(A, B)
+    sC = sA * sB
+    C = scale(sC, AB)
 
-
-def mm8_vjp(A: F8, B: F8, sA: F16, sB: F16, dret: F16) -> Tuple[F16, F16, F16, F16]:
-    sAA = scale(sA, A)
-    sBB = scale(sB, B)
-    # ret = mm(sAA, sBB)
-
-    dsAA, dsBB = mm_vjp(sAA, sBB, dret)
-    dsB, dB = scale_vjp(sB, B, dsBB)
-    dsA, dA = scale_vjp(sA, A, dsAA)
-    return (dA, dB, dsA, dsB)
-
-
-def test_mm8():
-    check(mm8, mm8_vjp, np.random.randn(7, 5), np.random.randn(5, 3), 1.23, 2.34)
-
-
-def mm8opt_vjp(A: F8, B: F8, sA: F16, sB: F16, dret: F16) -> Tuple[F16, F16, F16, F16]:
-    dsAA_ = mm(dret, B.T)
-    dsBB_ = mm(A.T, dret)
-
-    dsB = sA * dotall(B, dsBB_)
-    dB = scale(sA * sB, dsBB_)
-
-    dsA = sB * dotall(A, dsAA_)
-    dA = scale(sA * sB, dsAA_)
+    dsC, dAB = scale_vjp(sC, AB, dC)
+    dsA, dsB = sB * dsC, sA * dsC
+    dA, dB = mm_vjp(A, B, dAB)
 
     return (dA, dB, dsA, dsB)
 
 
-def test_mm8opt():
-    check(mm8, mm8opt_vjp, np.random.randn(7, 5), np.random.randn(5, 3), 1.23, 2.34)
+def test_mm_scaled():
+    check(
+        mm_scaled,
+        mm_scaled_vjp,
+        np.random.randn(7, 5),
+        np.random.randn(5, 3),
+        1.23,
+        2.34,
+    )
+
+
+def mm_scaledopt_vjp(A, B, sA, sB, dC) -> Tuple[F16, F16, F16, F16]:
+    s = sA * sB
+
+    dA = s * mm(dC, B.T)
+    dB = s * mm(A.T, dC)
+
+    if True:  # Want dsA, dsB
+        AB = mm(A, B)
+        dsC = dotall(AB, dC)
+        dsA = sB * dsC
+        dsB = sA * dsC
+
+    return (dA, dB, dsA, dsB)
+
+
+def test_mm_scaledopt():
+    check(
+        mm_scaled,
+        mm_scaledopt_vjp,
+        np.random.randn(7, 5),
+        np.random.randn(5, 3),
+        1.23,
+        2.34,
+    )
 
 
 # scale
