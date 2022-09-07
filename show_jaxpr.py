@@ -225,7 +225,6 @@ def show_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
     Show XLA for f, using template args
     """
     xla = jax.xla_computation(f, **kwargs)(*args)
-    print("XLA=", xla.as_hlo_text(), file=file)
 
     if optimized:
         e = jax.lib.xla_bridge.get_backend().compile(xla)
