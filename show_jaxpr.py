@@ -239,6 +239,25 @@ def show_jaxpr_and_xla(f, args, file=sys.stdout, **kwargs):
     show_xla(f, args, file=file, **kwargs)
 
 
+def test_basic():
+    def foo(p, x, q):
+        x = jax.numpy.matmul(x, p * x.T)
+        return (x + x[3]).std()
+
+    gradf = jax.grad(foo, argnums=1)
+    vmapgradf = jax.vmap(gradf, in_axes=(None, 2, None))
+
+    f = vmapgradf
+
+    prng = jax.random.PRNGKey(42)
+    args = (2.2, jax.random.normal(prng, (3, 2, 5)), "q")
+
+    print("f(args)=")
+    print(f(*args))
+
+    show_jaxpr(f, args, name="f")
+
+
 def test_roundtrip():
     import os
 
