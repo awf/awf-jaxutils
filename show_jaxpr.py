@@ -1,8 +1,10 @@
 import types
-import numpy as np
-import jax
 import sys
 import re
+import numpy as np
+
+import jax
+import jaxlib.xla_extension as xla_ext
 
 
 def cat(xs):
@@ -256,6 +258,7 @@ def test_basic():
     print(f(*args))
 
     show_jaxpr(f, args, name="f")
+    show_xla(f, args)
 
 
 def test_roundtrip():
