@@ -64,6 +64,14 @@ def check(f, f_grad, *args, rtol=1e-5, atol=1e-7, verbose=False):
     assert tree_all(isclose)
 
 
+#########################################
+##
+## Vector-Jacobian products for various simple ops
+##
+
+# add
+
+
 def add(x, y):
     return x + y
 
@@ -104,6 +112,25 @@ def pair_vjp(x, y, *dret):
 
 def test_pair():
     check(pair, pair_vjp, np.random.randn(13, 7), np.random.randn(13, 7))
+
+
+# scale scalar * Tensor
+
+
+def scale(s, x):
+    assert jnp.shape(s) == ()
+    return s * x
+
+
+def scale_vjp(s, x, dret):
+    ds = dotall(x, dret)
+    dx = scale(s, dret)
+
+    return (ds, dx)
+
+
+def test_scale():
+    check(scale, scale_vjp, 3.3, np.random.randn(13, 7))
 
 
 # axpy
@@ -223,25 +250,6 @@ def test_mm_scaledopt():
         1.23,
         2.34,
     )
-
-
-# scale
-
-
-def scale(s, x):
-    assert jnp.shape(s) == ()
-    return s * x
-
-
-def scale_vjp(s, x, dret):
-    ds = dotall(x, dret)
-    dx = scale(s, dret)
-
-    return (ds, dx)
-
-
-def test_scale():
-    check(scale, scale_vjp, 3.3, np.random.randn(13, 7))
 
 
 # recip
