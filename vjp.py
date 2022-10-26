@@ -203,7 +203,7 @@ def mm_scaled(A, B, sA, sB):
     return C
 
 
-def mm_scaled_vjp(A, B, sA, sB, dC):
+def mm_scaled_vjp_simple(A, B, sA, sB, dC):
     AB = mm(A, B)
     sC = sA * sB
     C = scale(sC, AB)
@@ -211,6 +211,30 @@ def mm_scaled_vjp(A, B, sA, sB, dC):
     dsC, dAB = scale_vjp(sC, AB, dC)
     dsA, dsB = sB * dsC, sA * dsC
     dA, dB = mm_vjp(A, B, dAB)
+
+    return (dA, dB, dsA, dsB)
+
+
+def test_mm_scaled_simple():
+    check(
+        mm_scaled,
+        mm_scaled_vjp_simple,
+        np.random.randn(7, 5),
+        np.random.randn(5, 3),
+        1.23,
+        2.34,
+    )
+
+
+def mm_scaled_vjp(A, B, sA, sB, dC):
+    dA = sA * mm_scaled(dC, B.T, 1.0, sB)
+    dB = sB * mm_scaled(A.T, dC, sA, 1.0)
+
+    if True:  # Want dsA, dsB
+        AB = mm(A, B)
+        dsC = dotall(AB, dC)
+        dsA = sB * dsC
+        dsB = sA * dsC
 
     return (dA, dB, dsA, dsB)
 
@@ -226,32 +250,6 @@ def test_mm_scaled():
     )
 
 
-def mm_scaledopt_vjp(A, B, sA, sB, dC):
-    s = sA * sB
-
-    dA = s * mm(dC, B.T)
-    dB = s * mm(A.T, dC)
-
-    if True:  # Want dsA, dsB
-        AB = mm(A, B)
-        dsC = dotall(AB, dC)
-        dsA = sB * dsC
-        dsB = sA * dsC
-
-    return (dA, dB, dsA, dsB)
-
-
-def test_mm_scaledopt():
-    check(
-        mm_scaled,
-        mm_scaledopt_vjp,
-        np.random.randn(7, 5),
-        np.random.randn(5, 3),
-        1.23,
-        2.34,
-    )
-
-
 # recip
 def recip(x):
     r = 1 / x
@@ -259,7 +257,7 @@ def recip(x):
 
 
 def recip_vjp(x, dr):
-    return -dr / x**2
+    return -dr / x ** 2
 
 
 def test_recip():
@@ -305,7 +303,6 @@ def index(x, i):
 
 
 def index_vjp(x, i, dret):
-    ret = jnn.softmax(x)
     return jnn.one_hot(i, len(x)) * dret
 
 
