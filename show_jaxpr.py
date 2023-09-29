@@ -99,7 +99,7 @@ def varstr(x):
 
 
 def pytype(x):
-    if isinstance(x, jax.ShapedArray):
+    if isinstance(x, jax.core.ShapedArray):
         return (
             f"ShapedArray({x.shape}, {x.dtype}, {x.weak_type}, {repr(x.named_shape)})"
         )
@@ -128,7 +128,7 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
 
     for cv in jaxpr.constvars:
         assert cv not in ["if", "in", "is"]  # if it is, use varstr(cv) on next line
-        print(f"{indent}{cv} = ?", file=file)
+        print(f"{indent}{varstr(cv)} = {cv.aval} # constant", file=file)
 
     for eqn in jaxpr.eqns:
 
@@ -165,9 +165,14 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             new_params[key] = jax.core.Literal(n, None)
 
         primname = eqn.primitive.name + "_p.bind"
-        if eqn.primitive is jax.interpreters.xla.xla_call_p:
-            # Handle xla_call specially - essentially erase it.  TODO: do we ever need to preserve the xla_call annotations?
+        if False and eqn.primitive is jax.interpreters.xla.xla_call_p:
+            # TODO Handle xla_call specially - essentially erase it.  TODO: do we ever need to preserve the xla_call annotations?
             callee = new_params["call_jaxpr"]
+            translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
+
+        elif eqn.primitive is jax._src.pjit.pjit_p:
+            # TODO Handle pjit_p specially - essentially erase it.  TODO: do we ever need to preserve the pjit annotations?
+            callee = new_params["jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
 
         else:
@@ -186,34 +191,39 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
     print(f"{indent}return ({intercommavars(*jaxpr.outvars)})", file=file)
 
 
-def show_jaxpr(f, args, name=None, file=sys.stdout, **kwargs):
+def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
     """
     Show jaxpr f as if in python, i.e. "decompile" to python
     """
 
-    print(
-        f"""
+    if add_decls:
+        print(
+            f"""
 # show_jaxpr {f}
 from jax.lax import *
+from jax.lax import transpose_p
 import jax.numpy as jnp
 from numpy import float32,int32
 
 add_any_p = add_p
 
-DeviceArray = jnp.array
 """,
-        file=file,
-    )
+            file=file,
+        )
 
     if name is None:
         name = f.__name__
 
-    closed_jaxpr = jax.make_jaxpr(f, **kwargs)(*args)
-    examine_jaxpr(name, closed_jaxpr.jaxpr, doc=f.__doc__, file=file)
+    doc = f.__doc__
+
+    jaxpr = jax.make_jaxpr(f, **kwargs)
+    closed_jaxpr = jaxpr(*args)
+    examine_jaxpr(name, closed_jaxpr.jaxpr, doc=doc, file=file)
 
     print(
         f"""
 if __name__ == '__main__':
+    Array = jnp.array
     {name}{args}
 """,
         file=file,
@@ -241,17 +251,17 @@ def show_jaxpr_and_xla(f, args, file=sys.stdout, **kwargs):
 
 
 def test_basic():
-    def foo(p, x, q):
+    def foo(p, x):
         x = jax.numpy.matmul(x, p * x.T)
         return (x + x[3]).std()
 
     gradf = jax.grad(foo, argnums=1)
-    vmapgradf = jax.vmap(gradf, in_axes=(None, 2, None))
+    vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
 
     f = vmapgradf
 
     prng = jax.random.PRNGKey(42)
-    args = (2.2, jax.random.normal(prng, (3, 2, 5)), "q")
+    args = (2.2, jax.random.normal(prng, (3, 2, 5)))
 
     print("f(args)=")
     print(f(*args))
@@ -263,17 +273,17 @@ def test_basic():
 def test_roundtrip():
     import os
 
-    def foo(p, x, q):
+    def foo(p, x):
         x = jax.numpy.matmul(x, p * x.T)
         return (x + x[3]).std()
 
     gradf = jax.grad(foo, argnums=1)
-    vmapgradf = jax.vmap(gradf, in_axes=(None, 2, None))
+    vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
 
     f = vmapgradf
 
     prng = jax.random.PRNGKey(42)
-    args = (2.2, jax.random.normal(prng, (3, 2, 5)), "q")
+    args = (2.2, jax.random.normal(prng, (3, 2, 5)))
 
     print("f(args)=")
     print(f(*args))
@@ -281,7 +291,7 @@ def test_roundtrip():
     # Save to file
     fn = "tmp/show_jaxpr_jaxpr.py"
     with open(fn, "w") as file:
-        show_jaxpr(f, args, name="f", file=file)
+        show_jaxpr(f, args, name="f", file=file, add_decls=True)
 
     os.system(f"black {fn}")
 
@@ -300,7 +310,7 @@ def test_roundtrip():
     # Save again
     fn2 = "tmp/show_jaxpr_roundtrip.py"
     with open(fn2, "w") as file2:
-        show_jaxpr(module.f, args, file=file2)
+        show_jaxpr(module.f, args, file=file2, add_decls=True)
 
     os.system(f"black {fn2}")
 
@@ -316,7 +326,7 @@ def test_roundtrip():
     # Sand save 2nd roundtrip
     fn3 = "tmp/show_jaxpr_roundtrip2.py"
     with open(fn3, "w") as file3:
-        show_jaxpr(module2.f, args, file=file3)
+        show_jaxpr(module2.f, args, file=file3, add_decls=True)
 
     os.system(f"black {fn3}")
 
