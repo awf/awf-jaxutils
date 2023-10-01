@@ -131,7 +131,6 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
         print(f"{indent}{varstr(cv)} = {cv.aval} # constant", file=file)
 
     for eqn in jaxpr.eqns:
-
         ## Recursively dump sub-jaxprs, and add references to params
         new_params = {}
         for key, val in eqn.params.items():
@@ -237,7 +236,7 @@ def show_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
     xla = jax.xla_computation(f, **kwargs)(*args)
 
     if optimized:
-        e = jax.lib.xla_bridge.get_backend().compile(xla)
+        e = jax.lib.xla_bridge.get_backend().compile(xla.get_hlo_module())
         module = e.hlo_modules()[0]
     else:
         module = xla.get_hlo_module()
@@ -245,9 +244,9 @@ def show_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
     print(module.to_string(option), file=file)
 
 
-def show_jaxpr_and_xla(f, args, file=sys.stdout, **kwargs):
+def show_jaxpr_and_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
     show_jaxpr(f, args, file=file, **kwargs)
-    show_xla(f, args, file=file, **kwargs)
+    show_xla(f, args, file=file, optimized=optimized, **kwargs)
 
 
 def test_basic():
@@ -268,6 +267,7 @@ def test_basic():
 
     show_jaxpr(f, args, name="f")
     show_xla(f, args)
+    # show_xla(f, args, optimized=True)
 
 
 def test_roundtrip():

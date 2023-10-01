@@ -1,3 +1,22 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my_package"
+authors = [
+    {name = "Andrew Fitzgibbon", email = "awf@fitzgibbon.ie"},
+]
+description = "Some JAX utilities"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "BSD-3-Clause"}
+dynamic = ["dependencies"]
+version = "1.0"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
 [tool.black]
 line-length = 88
 include = '\.pyi?$'
@@ -11,5 +30,9 @@ testpaths = [
 ]
 python_files = [
     "vjp.py",
-    "show_jaxpr.py"
+    "show_jaxpr.py",
+    "expr.py"
 ]
+
+[tool.setuptools]
+packages = ["jaxutils"]

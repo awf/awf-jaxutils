@@ -257,7 +257,7 @@ def recip(x):
 
 
 def recip_vjp(x, dr):
-    return -dr / x ** 2
+    return -dr / x**2
 
 
 def test_recip():
