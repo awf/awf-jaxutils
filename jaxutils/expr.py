@@ -25,7 +25,7 @@ class Expr:
 
         Const:   Constant
         Var:     Variable name
-        Let:     Let var = val in Expr
+        Let:     Let vars = val in Expr
         Lambda:  Lambda vars . body
         Call:    Call (func: Expr) (args : List[Expr])
 
@@ -71,7 +71,7 @@ class Var(Expr):
 
 @exprclass
 class Let(Expr):
-    var: Var
+    vars: List[Var]
     val: Expr
     body: Expr
 
@@ -106,7 +106,7 @@ def freevars(e: Expr) -> set[Var]:
         return {e}
 
     if e.ty is Let:
-        fv_body = setminus(freevars(e.body), e.var)
+        fv_body = set.difference(freevars(e.body), set(e.vars))
         fv_val = freevars(e.val)
         return set.union(fv_val, fv_body)
 
@@ -130,9 +130,9 @@ def _make_e():
     a_lam = Lambda([z], Call(v_sin, [z]))
     call_lam = Call(a_lam, [x])
     foo_lam = Lambda(
-        [x, y], Let(z, Call(v_add, [x, Const(3.3)]), Call(v_mul, [call_lam, y]))
+        [x, y], Let([z], Call(v_add, [x, Const(3.3)]), Call(v_mul, [call_lam, y]))
     )
-    e = Let(foo, foo_lam, Call(foo, [Const(1.1), Const(2.2)]))
+    e = Let([foo], foo_lam, Call(foo, [Const(1.1), Const(2.2)]))
     return e
 
 
@@ -185,7 +185,7 @@ def let_to_lambda(e: Expr) -> Expr:
     if e.ty is Let:
         val = let_to_lambda(e.val)
         body = let_to_lambda(e.body)
-        return Call(Lambda([e.var], body), [val])
+        return Call(Lambda(e.vars, body), [val])
 
     if e.ty is Lambda:
         body = let_to_lambda(e.body)
@@ -255,11 +255,11 @@ def to_ast_aux(e, assignments):
 
     if e.ty is Let:
         print('Nested assignments may be flaky - use "let_to_lambda"')
-        avar = ast.Name(e.var.name, ast.Store())
+        avars = [ast.Name(var.name, ast.Store()) for var in e.vars]
         aval = to_ast_aux(e.val, assignments)
         inner_assignments = []
         abody = to_ast_aux(e.body, inner_assignments)
-        assign = ast.Assign(targets=[avar], value=aval)
+        assign = ast.Assign(targets=avars, value=aval)
         assignments += [assign]
         assignments += inner_assignments
         return abody
