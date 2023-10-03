@@ -4,6 +4,8 @@ import re
 import numpy as np
 
 import jax
+import jax._src
+import jax._src.core
 import jaxlib.xla_extension as xla_ext
 
 def pythonize(name):
@@ -12,31 +14,6 @@ def pythonize(name):
     if new_name != name and name != "scatter-add":
         print(f"Note: pythonize converted {name} to {new_name}")
     return new_name
-
-def toExpr(x):
-    if isinstance(
-        x,
-        (
-            tuple,
-            type(None),
-            jax.numpy.dtype,
-            jax.lax.GatherScatterMode,
-            jax.lax.GatherDimensionNumbers,
-            str, bool, int, np.float32, np.int32
-         ),
-    ):
-        return Const(x)
-
-    if isinstance(x, jax.core.Var):
-        return Var(f'v_{x.count:02d}{x.suffix}')
-
-    if isinstance(x, (types.FunctionType)):
-        return Var(x.__module__ + "." + x.__name__)
-
-    # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
-    # Explicitly add verified cases to 
-    assert False, f"Check this shouldn't be transformed [{repr(x)}]"
-
 
 def pytype(x):
     if isinstance(x, jax.core.ShapedArray):
@@ -59,9 +36,41 @@ import jax.numpy as jnp
 from icecream import ic
 from jaxutils.expr import Var,Const,Lambda,Let,Call
 
+def toExpr(x):
+    if isinstance(
+        x,
+        (
+            tuple,
+            type(None),
+            jax.numpy.dtype,
+            jax.lax.GatherScatterMode,
+            jax.lax.GatherDimensionNumbers,
+            str, bool, int, np.float32, np.int32, float
+         ),
+    ):
+        return Const(x)
+
+    if isinstance(x, jax._src.core.Literal):
+        return Const(x.val)
+
+    if isinstance(x, jax.core.Jaxpr):
+        return jaxpr_to_expr(x)
+
+    if isinstance(x, jax.core.ClosedJaxpr):
+        new_val = jaxpr_to_expr(x.jaxpr)
+
+    if isinstance(x, jax.core.Var):
+        return Var(f'v_{x.count:02d}{x.suffix}')
+
+    # if isinstance(x, (types.FunctionType)):
+    #     return Var(x.__module__ + "." + x.__name__)
+
+    # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
+    # Explicitly add verified cases to 
+    assert False, f"Check {type(x)} shouldn't be transformed [{repr(x)}]"
+
 def toExprs(vars):
     return [toExpr(v) for v in vars]
-
 
 def jaxpr_to_expr(jaxpr) -> Lambda:
     """
@@ -149,8 +158,7 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
     
     from jaxutils.expr import to_ast, freevars
     import ast
-    print(freevars(e))
-    # print(ast.unparse(to_ast(e, 'e')))
+    print(ast.unparse(to_ast(e, 'e')))
 
 
 
