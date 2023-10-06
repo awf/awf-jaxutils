@@ -1,17 +1,16 @@
 from dataclasses import dataclass
 from beartype import beartype
 from beartype.typing import List, Set, Any, Tuple, Type, List, Callable
+from pprint import pprint
+
+name_id = 0
 
 
-@beartype
-def setminus(s: set, v: Any):
-    """
-    return s - {v}
-    """
-    return set.difference(s, set((v,)))
+def get_new_name():
+    global name_id
+    name_id += 1
+    return f"{name_id:02d}"
 
-
-assert setminus(set((1, 3, 6)), 3) == set((1, 6))
 
 ## Declare Expr classes
 
@@ -45,11 +44,35 @@ class Expr:
         from the fixed list Const, Var, Let, Lambda, Call.
 
         Primary use is in writing `e.ty is Var` rather than `isinstance(e, Var)`
+
+        Code which instead use `isCall` etc is less likely to 
+        fall foul of `e.body is Call` rather than `e.body.ty is Call` 
         """
         for ty in (Const, Var, Let, Lambda, Call):
             if isinstance(self, ty):
                 return ty
         assert f"Bad type {self}"
+
+    @property
+    def isConst(self):
+        return isinstance(self, Const)
+
+    @property
+    def isVar(self):
+        return isinstance(self, Var)
+
+    @property
+    def isCall(self):
+        return isinstance(self, Call)
+
+    @property
+    def isLambda(self):
+        return isinstance(self, Lambda)
+
+    @property
+    def isLet(self):
+        return isinstance(self, Let)
+
 
 
 def exprclass(klass, **kwargs):
@@ -99,21 +122,21 @@ def mkvars(s: str) -> Tuple[Var]:
 
 
 def freevars(e: Expr) -> set[Var]:
-    if e.ty is Const:
+    if e.isConst:
         return set()
 
-    if e.ty is Var:
+    if e.isVar:
         return {e}
 
-    if e.ty is Let:
+    if e.isLet:
         fv_body = set.difference(freevars(e.body), set(e.vars))
         fv_val = freevars(e.val)
         return set.union(fv_val, fv_body)
 
-    if e.ty is Lambda:
+    if e.isLambda:
         return set.difference(freevars(e.body), e.args)
 
-    if e.ty is Call:
+    if e.isCall:
         return set.union(freevars(e.f), *(freevars(arg) for arg in e.args))
 
     assert False
@@ -142,9 +165,7 @@ def test_basic():
 
     e = _make_e()
 
-    from prettyprinter import cpprint
-
-    cpprint(e)
+    pprint(e)
     assert freevars(e) == {v_sin, v_add, v_mul}
     assert freevars(e.val) == {v_sin, v_add, v_mul}
     assert freevars(e.val.body) == {x, y, v_sin, v_add, v_mul}
@@ -155,14 +176,14 @@ def visit(e: Expr, f: Callable[[Expr], Any]):
     f(e)
 
     # And recurse into children
-    if e.ty is Let:
+    if e.isLet:
         visit(e.val, f)
         visit(e.body, f)
 
-    if e.ty is Lambda:
+    if e.isLambda:
         visit(e.body, f)
 
-    if e.ty is Call:
+    if e.isCall:
         visit(e.f, f)
         for arg in e.args:
             visit(arg, f)
@@ -182,16 +203,16 @@ def let_to_lambda(e: Expr) -> Expr:
     if e.ty in (Const, Var):
         return e
 
-    if e.ty is Let:
+    if e.isLet:
         val = let_to_lambda(e.val)
         body = let_to_lambda(e.body)
         return Call(Lambda(e.vars, body), [val])
 
-    if e.ty is Lambda:
+    if e.isLambda:
         body = let_to_lambda(e.body)
         return Lambda(e.args, body)
 
-    if e.ty is Call:
+    if e.isCall:
         f = let_to_lambda(e.f)
         args = [let_to_lambda(arg) for arg in e.args]
         return Call(f, args)
@@ -204,22 +225,92 @@ def test_let_to_lambda():
     l = let_to_lambda(e)
 
     def check(e):
-        assert not e.ty is Let
+        assert not e.isLet
 
     visit(l, check)
 
+def uniquify_names(e : Expr):
+    translations = {v.name:v.name for v in freevars(e)}
+    return uniquify_names_aux(e, translations)
+
+def uniquify_names_aux(e : Expr, translations) -> Expr:
+    # foo(let x = 2 in f(x), x)
+    #  -> foo(let x_new = 2 in f(x_new), x)
+    # i.e. a let which binds a var which is already in scope will
+    # need to rename that var.
+    # Thus there will be a translation table of oldnames to newnames
+    # When entering a let or lambda, if a var is already in the table
+    # it will need further renaming, so make a new entry for the body
+    # Vars that come newly in scope should be translated to themselves
+    if e.isConst:
+        return e
+    
+    if e.isVar:
+        return Var(translations.get(e.name, e.name))
+        
+    if e.isCall:
+        return Call(
+            uniquify_names_aux(e.f, translations),
+             [uniquify_names_aux(arg, translations) for arg in e.args]
+        )
+    
+    assert e.isLet or e.isLambda
+
+    if e.isLet:
+        vars = e.vars
+    if e.isLambda:
+        vars = e.args
+
+    new_translations = {**translations}
+    new_vars = []
+    for var in [var.name for var in vars]:
+        # This var has just come in scope.
+        # If its name is already in translations, it is clashing,
+        # so in the body of this let, it will need a new name
+        if var in new_translations:
+            newname = 't_' + get_new_name()
+        else:
+            newname = var
+        new_translations[var] = newname
+        new_vars.append(Var(newname))
+
+    if e.isLet:
+        new_val = uniquify_names_aux(e.val, translations)
+        new_body = uniquify_names_aux(e.body, new_translations)
+        return Let(new_vars, new_val, new_body)
+
+    if e.isLambda:
+        new_body = uniquify_names_aux(e.body, new_translations)
+        return Lambda(new_vars, new_body)
+
+def test_uniquify_names():
+    a,b,c,d = mkvars('a,b,c,d')
+    
+
+    e = Let([a], a, Let([a], b, Call(b, [a, b])))
+    pprint(e)
+    out = uniquify_names(e)
+    pprint(out)
+    assert out.vars[0] != a
+    assert out.val == a
+    assert out.body.vars[0] != a
+    assert out.body.vars[0] != out.vars[0]
 
 ######### AST
 
 import ast
 
+def to_ast_FunctionDef(name, args, body):
+    return ast.FunctionDef(name=name, args=args, body=body, decorator_list=[], lineno=0)
+
 
 def to_ast(e, name):
+    e = uniquify_names(e)
     assignments = []
     expr = to_ast_aux(e, assignments)
     assignments += [ast.Return(expr)]
     args = to_ast_args(list(freevars(e)))
-    a = to_ast_fndef(name, args, assignments)
+    a = to_ast_FunctionDef(name, args, assignments)
     a = ast.Module(body=[a], type_ignores=[])
     ast.fix_missing_locations(a)
     return a
@@ -233,29 +324,19 @@ def to_ast_args(vars: List[Var]) -> ast.arguments:
     )
 
 
-def to_ast_fndef(name, args, body):
-    return ast.FunctionDef(name=name, args=args, body=body, decorator_list=[], lineno=0)
-
-
-name_id = 0
-
-
-def get_new_name():
-    global name_id
-    name_id += 1
-    return f"f{name_id:02d}"
-
 
 def to_ast_aux(e, assignments):
-    if e.ty is Const:
+    if e.isConst:
         return ast.Constant(value=e.val)
 
-    if e.ty is Var:
+    if e.isVar:
         return ast.Name(e.name, ast.Load())
 
-    if e.ty is Let:
-        print('Nested assignments may be flaky - use "let_to_lambda"')
+    if e.isLet:
         avars = [ast.Name(var.name, ast.Store()) for var in e.vars]
+        if len(avars) > 1:
+            avars = [ast.Tuple(avars, ast.Store())]
+
         aval = to_ast_aux(e.val, assignments)
         inner_assignments = []
         abody = to_ast_aux(e.body, inner_assignments)
@@ -264,26 +345,36 @@ def to_ast_aux(e, assignments):
         assignments += inner_assignments
         return abody
 
-    if e.ty is Lambda:
+    if e.isLambda:
         inner_assignments = []
         abody = to_ast_aux(e.body, inner_assignments)
         inner_assignments += [ast.Return(abody)]
-        name = get_new_name()
+        name = 'f' + get_new_name()
         aargs = to_ast_args(e.args)
-        fdef = to_ast_fndef(name, aargs, inner_assignments)
+        fdef = to_ast_FunctionDef(name, aargs, inner_assignments)
         assignments += [fdef]
         return to_ast_aux(Var(name), None)
 
-    if e.ty is Call:
+    if e.isCall:
         f = to_ast_aux(e.f, assignments)
         args = [to_ast_aux(arg, assignments) for arg in e.args]
         return ast.Call(func=f, args=args, keywords=[])
 
     assert False
 
+def foo():
+    a,b = 123
+
 
 def test_ast():
-    import astunparse
+    # To see what bits of AST should be
+    # print(ast.dump(ast.parse(inspect.getsource(foo)), indent=2))
+
+    a,b = mkvars("a,b")
+    e = Let([a,b], Const(123), Const(234))
+    pprint(e)
+    a = to_ast(e, "e")
+    print(ast.unparse(a))
 
     e = _make_e()
     a = to_ast(e, "e")
