@@ -38,22 +38,6 @@ class Expr:
     """
 
     @property
-    def ty(self):
-        """
-        Return type of this object, assumed a sublcass of Expr,
-        from the fixed list Const, Var, Let, Lambda, Call.
-
-        Primary use is in writing `e.ty is Var` rather than `isinstance(e, Var)`
-
-        Code which instead use `isCall` etc is less likely to 
-        fall foul of `e.body is Call` rather than `e.body.ty is Call` 
-        """
-        for ty in (Const, Var, Let, Lambda, Call):
-            if isinstance(self, ty):
-                return ty
-        assert f"Bad type {self}"
-
-    @property
     def isConst(self):
         return isinstance(self, Const)
 
@@ -119,6 +103,27 @@ def mkvars(s: str) -> Tuple[Var]:
     """
     s = s.replace(" ", "")
     return [Var(s) for s in s.split(",")]
+
+def transform(transformer: Callable[[Expr], Expr], e: Expr):
+    recurse = lambda e: transform(transformer, e)
+
+    # Recurse into children
+    if e.isLet:
+        new_val = recurse(e.val)
+        new_body = recurse(e.body)
+        e = Let(e.vars, new_val, new_body)
+
+    if e.isLambda:
+        e = Lambda(e.args, recurse(e.body))
+
+    if e.isCall:
+        new_f = recurse(e.f)
+        new_args = [recurse(arg) for arg in e.args]
+        e = Call(new_f, new_args)
+
+    # And pass self to the transformer, with updated children
+    return transformer(e) or e
+
 
 
 def freevars(e: Expr) -> set[Var]:
@@ -191,7 +196,7 @@ def visit(e: Expr, f: Callable[[Expr], Any]):
 
 def test_visit():
     e = _make_e()
-    visit(e, lambda x: print(x.ty))
+    visit(e, lambda x: print(type(x)))
 
 
 def let_to_lambda(e: Expr) -> Expr:
@@ -200,29 +205,15 @@ def let_to_lambda(e: Expr) -> Expr:
     ->
     call(lambda x: body, val)
     """
-    if e.ty in (Const, Var):
-        return e
-
     if e.isLet:
-        val = let_to_lambda(e.val)
-        body = let_to_lambda(e.body)
+        val = transform(let_to_lambda, e.val)
+        body = transform(let_to_lambda, e.body)
         return Call(Lambda(e.vars, body), [val])
-
-    if e.isLambda:
-        body = let_to_lambda(e.body)
-        return Lambda(e.args, body)
-
-    if e.isCall:
-        f = let_to_lambda(e.f)
-        args = [let_to_lambda(arg) for arg in e.args]
-        return Call(f, args)
-
-    assert False, str(e)
 
 
 def test_let_to_lambda():
     e = _make_e()
-    l = let_to_lambda(e)
+    l = transform(let_to_lambda, e)
 
     def check(e):
         assert not e.isLet

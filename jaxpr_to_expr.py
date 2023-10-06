@@ -2,7 +2,7 @@ import types
 import sys
 import re
 import numpy as np
-from typing import Callable, Optional
+from typing import Callable, Optional, Any
 from beartype import beartype
 
 import jax
@@ -18,7 +18,7 @@ import jax.numpy as jnp
 
 from jaxutils.expr import Expr, Var, Const, Lambda, Let, Call
 
-from jaxutils.expr import to_ast, freevars, uniquify_names, mkvars
+from jaxutils.expr import to_ast, freevars, uniquify_names, mkvars, transform
 
 import ast
 
@@ -70,6 +70,8 @@ def toExpr(x) -> Expr:
 translators: dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
 
 PJIT_PASSTHRU = True
+
+
 def translate_pjit(
     *args,
     jaxpr=None,
@@ -82,10 +84,11 @@ def translate_pjit(
     inline=False,
 ):
     if not PJIT_PASSTHRU:
-        return Call(Var('pjit'), [jaxpr] + list(*args))
+        return Call(Var("pjit"), [jaxpr] + list(*args))
 
     if unspecified(in_shardings.val) and unspecified(out_shardings.val):
         return Call(jaxpr, list(*args))
+
 
 translators[jax._src.pjit.pjit_p] = translate_pjit
 
@@ -118,24 +121,6 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
 
     args = [toExpr(v) for v in jaxpr.invars]
     return Lambda(args, body)
-
-
-def transform(e: Expr, transformer: Callable[[Expr], Expr]):
-    # Recurse into children
-    if e.isLet:
-        new_val = transform(e.val, transformer)
-        new_body = transform(e.body, transformer)
-        e = Let(e.vars, new_val, new_body)
-
-    if e.isLambda:
-        e = Lambda(e.args, transform(e.body, transformer))
-
-    if e.isCall:
-        new_f = transform(e.f, transformer)
-        new_args = [transform(arg, transformer) for arg in e.args]
-        e = Call(new_f, new_args)
-
-    return transformer(e) or e
 
 
 def mkTuple(es: list[Expr]) -> Expr:
@@ -238,21 +223,23 @@ def to_ssa_aux(e, assignments):
 
     assert False
 
-def is_trivial(e : Expr):
+
+def is_trivial(e: Expr):
     if e.isVar:
         return True
-    
+
     if e.isConst and isinstance(e.val, (float, str, int)):
-        return True 
+        return True
 
     return False
+
 
 def inline_trivial_assignments(e):
     return inline_trivial_assignments_aux(e, {})
 
 
 @beartype
-def inline_trivial_assignments_aux(e : Expr, translations : dict[str, Expr]):
+def inline_trivial_assignments_aux(e: Expr, translations: dict[str, Expr]):
     # let a = b in body -> body[a->b]
 
     recurse = inline_trivial_assignments_aux
@@ -264,13 +251,11 @@ def inline_trivial_assignments_aux(e : Expr, translations : dict[str, Expr]):
         return translations.get(e.name, e)
 
     if e.isLet:
-        # let vars = val in body 
+        # let vars = val in body
         if len(e.vars) == 1 and is_trivial(e.val):
             argset = {v.name for v in e.vars}
             new_translations = {
-                name: val
-                for (name, val) in translations.items()
-                if name not in argset
+                name: val for (name, val) in translations.items() if name not in argset
             }
 
             assert e.vars[0].name not in new_translations
@@ -284,9 +269,7 @@ def inline_trivial_assignments_aux(e : Expr, translations : dict[str, Expr]):
     if e.isLambda:
         argset = {v.name for v in e.args}
         new_translations = {
-            name: val
-            for (name, val) in translations.items()
-            if name not in argset
+            name: val for (name, val) in translations.items() if name not in argset
         }
         new_body = recurse(e.body, new_translations)
         return Lambda(e.args, new_body)
@@ -298,66 +281,81 @@ def inline_trivial_assignments_aux(e : Expr, translations : dict[str, Expr]):
 
     assert False
 
+
 def test_inline_trivial_assignments():
     a, b, c, d = mkvars("a,b,c,d")
-    e = Let([a], b, Call(a, [Let([a], c, Call(a,[a,b,c]))]))
+    e = Let([a], b, Call(a, [Let([a], c, Call(a, [a, b, c]))]))
     out = inline_trivial_assignments(e)
     pprint(out)
-    expect = Call(b, [Call(c, [c,b,c])])
+    expect = Call(b, [Call(c, [c, b, c])])
     assert out == expect
 
-def hash_eval(e : Expr):
-    
-    return hash_eval_aux(e, {})
 
 @beartype
-def hash_eval_aux(e : Expr, bindings : dict[Var, int]) -> int:
-    recurse = hash_eval_aux
+def run_eval(e: Expr, bindings: dict[Var, Any]) -> Any:
+    recurse = run_eval
 
     if e.isConst:
-        return hash(f'{e.val}')
+        return e.val
 
     if e.isVar:
-        varhash = 17
-        return bindings.get(e.name, varhash)
+        return bindings[e]
 
     if e.isCall:
         new_f = recurse(e.f, bindings)
         new_args = [recurse(arg, bindings) for arg in e.args]
-        return hash(('Call', new_f, *new_args)) # match [1]
+        assert isinstance(new_f, Callable)
+        return new_f(*new_args)
 
     if e.isLet:
-        # let vars = val in body 
+        # let vars = val in body
         argset = {v.name for v in e.vars}
         new_bindings = {
-            name: val
-            for (name, val) in bindings.items()
-            if name not in argset
+            name: val for (name, val) in bindings.items() if name not in argset
         }
 
-        tuphash = recurse(e.val, bindings)
+        tupval = recurse(e.val, bindings)
+        assert isinstance(tupval, tuple)
 
-        # let (a,b,c) = val in body
-        # So val must be a tuple, so each var's hash 
-        # should be the hash of "tuple-get(tuphash, n)"
-        for i,var in enumerate(e.vars):
-            gethash = recurse(Var('tuple-get'), {})
-            varhash = hash((gethash, tuphash, i)) # match [1]
-            new_bindings[var.name] = varhash
-          
+        for var, val in zip(e.vars, tupval):
+            new_bindings[var] = val
+
         return recurse(e.body, new_bindings)
 
     if e.isLambda:
-        argset = {v.name for v in e.args}
-        new_bindings = {
-            name: val
-            for (name, val) in bindings.items()
-            if name not in argset
-        }
-        new_body = recurse(e.body, new_bindings)
-        return hash(('Lambda', new_body))
+
+        def runLambda(e, vals, bindings):
+            argset = {v.name for v in e.args}
+            new_bindings = {
+                name: val for (name, val) in bindings.items() if name not in argset
+            }
+            for var, val in zip(e.args, vals):
+                new_bindings[var] = val
+
+            return recurse(e.body, new_bindings)
+
+        return lambda vals: runLambda(e, vals, bindings)
 
     assert False
+
+
+def test_eval():
+    import operator
+
+    a, b, c = mkvars("a,b,c")
+    f_tuple, f_add = mkvars("tuple, add")
+    f_defs = {
+        f_add: operator.add,
+        f_tuple: lambda *args: tuple(args),
+    }
+
+    v = run_eval(Call(f_add, [Const(2), Const(3)]), f_defs)
+    assert v == 5
+
+    v = run_eval(
+        Let([a, b], Call(f_tuple, [Const(2), Const(3)]), Call(f_add, [a, b])), f_defs
+    )
+    assert v == 5
 
 
 
@@ -367,7 +365,7 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
 
     Several optimization passes are run, to simplify the resulting code.
     If global arg PJIT_PASSTHRU is True, then pjit(f)(args) with unspecified sharding
-    is just rewritten to f(args), which can result in significantly simpler code. 
+    is just rewritten to f(args), which can result in significantly simpler code.
     """
 
     if name is None:
@@ -382,25 +380,32 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
     e = jaxpr_to_expr(closed_jaxpr.jaxpr)
 
     def signature(e):
-        print('HEV', hash_eval(e))
-        return set.union(freevars(e), {Var('tuple')})
-    
+        return set.union(freevars(e), {Var("tuple")})
+
     global sig
     sig = signature(e)
+
     def check(ex):
         global sig
         new_sig = signature(ex)
         assert sig == new_sig
         # sig = new_sig - if we wanted to keep going
 
-    e = uniquify_names(e) ; check(e)
+    e = uniquify_names(e)
+    check(e)
 
-    e = transform(e, inline_call_of_lambda); check(e)
-    e = transform(e, inline_trivial_letbody); check(e)
-    e = transform(e, inline_lambda_of_call); check(e)
-    e = to_ssa(e); check(e)
-    e = transform(e, detuple_tuple_assignments); check(e)
-    e = inline_trivial_assignments(e); check(e)
+    e = transform(inline_call_of_lambda, e)
+    check(e)
+    e = transform(inline_trivial_letbody, e)
+    check(e)
+    e = transform(inline_lambda_of_call, e)
+    check(e)
+    e = to_ssa(e)
+    check(e)
+    e = transform(detuple_tuple_assignments, e)
+    check(e)
+    e = inline_trivial_assignments(e)
+    check(e)
     print(ast.unparse(to_ast(e, "e")))
 
 
@@ -426,7 +431,6 @@ def test_basic():
     # )
     # print(python_code)
 
-
 def test_vmap():
     def foo(p, x):
         x = x @ (p * x.T)
@@ -445,6 +449,7 @@ def test_vmap():
     show_jaxpr(foo, args, name="f")
 
     show_jaxpr(vmapgradf, vargs, name="vmapgradf")
+
 
 # def test_roundtrip():
 #     import os
