@@ -3,6 +3,7 @@ import sys
 import re
 import numpy as np
 from typing import Callable, Optional
+from beartype import beartype
 
 import jax
 import jax._src
@@ -174,7 +175,7 @@ def inline_call_of_lambda(e: Expr) -> Expr:
         return Let(e.f.args, mkTuple(e.args), e.f.body)
 
 
-def inline_trivial_let(e: Expr) -> Expr:
+def inline_trivial_letbody(e: Expr) -> Expr:
     # let var = val in var -> val
     if e.isLet and len(e.vars) == 1:
         if e.vars == [e.body]:
@@ -237,35 +238,43 @@ def to_ssa_aux(e, assignments):
 
     assert False
 
+def is_trivial(e : Expr):
+    if e.isVar:
+        return True
+    
+    if e.isConst and isinstance(e.val, (float, str, int)):
+        return True 
 
-def remove_var_to_var_assignments(e):
-    return remove_var_to_var_assignments_aux(e, {})
+    return False
+
+def inline_trivial_assignments(e):
+    return inline_trivial_assignments_aux(e, {})
 
 
-def remove_var_to_var_assignments_aux(e, translations):
+@beartype
+def inline_trivial_assignments_aux(e : Expr, translations : dict[str, Expr]):
     # let a = b in body -> body[a->b]
 
-    recurse = remove_var_to_var_assignments_aux
+    recurse = inline_trivial_assignments_aux
 
     if e.isConst:
         return e
 
     if e.isVar:
-        return Var(translations.get(e.name, e.name))
+        return translations.get(e.name, e)
 
     if e.isLet:
         # let vars = val in body 
-        argset = {v.name for v in e.vars}
-        new_translations = {
-            name: newname
-            for (name, newname) in translations.items()
-            if name not in argset
-        }
+        if len(e.vars) == 1 and is_trivial(e.val):
+            argset = {v.name for v in e.vars}
+            new_translations = {
+                name: val
+                for (name, val) in translations.items()
+                if name not in argset
+            }
 
-        if e.val.isVar:
-            assert len(e.vars) == 1
             assert e.vars[0].name not in new_translations
-            new_translations[e.vars[0].name] = e.val.name
+            new_translations[e.vars[0].name] = e.val
             return recurse(e.body, new_translations)
         else:
             new_val = recurse(e.val, translations)
@@ -275,8 +284,8 @@ def remove_var_to_var_assignments_aux(e, translations):
     if e.isLambda:
         argset = {v.name for v in e.args}
         new_translations = {
-            name: newname
-            for (name, newname) in translations.items()
+            name: val
+            for (name, val) in translations.items()
             if name not in argset
         }
         new_body = recurse(e.body, new_translations)
@@ -289,14 +298,68 @@ def remove_var_to_var_assignments_aux(e, translations):
 
     assert False
 
-
-def test_remove_var_to_var_assignments():
+def test_inline_trivial_assignments():
     a, b, c, d = mkvars("a,b,c,d")
     e = Let([a], b, Call(a, [Let([a], c, Call(a,[a,b,c]))]))
-    out = remove_var_to_var_assignments(e)
+    out = inline_trivial_assignments(e)
     pprint(out)
     expect = Call(b, [Call(c, [c,b,c])])
     assert out == expect
+
+def hash_eval(e : Expr):
+    
+    return hash_eval_aux(e, {})
+
+@beartype
+def hash_eval_aux(e : Expr, bindings : dict[Var, int]) -> int:
+    recurse = hash_eval_aux
+
+    if e.isConst:
+        return hash(f'{e.val}')
+
+    if e.isVar:
+        varhash = 17
+        return bindings.get(e.name, varhash)
+
+    if e.isCall:
+        new_f = recurse(e.f, bindings)
+        new_args = [recurse(arg, bindings) for arg in e.args]
+        return hash(('Call', new_f, *new_args)) # match [1]
+
+    if e.isLet:
+        # let vars = val in body 
+        argset = {v.name for v in e.vars}
+        new_bindings = {
+            name: val
+            for (name, val) in bindings.items()
+            if name not in argset
+        }
+
+        tuphash = recurse(e.val, bindings)
+
+        # let (a,b,c) = val in body
+        # So val must be a tuple, so each var's hash 
+        # should be the hash of "tuple-get(tuphash, n)"
+        for i,var in enumerate(e.vars):
+            gethash = recurse(Var('tuple-get'), {})
+            varhash = hash((gethash, tuphash, i)) # match [1]
+            new_bindings[var.name] = varhash
+          
+        return recurse(e.body, new_bindings)
+
+    if e.isLambda:
+        argset = {v.name for v in e.args}
+        new_bindings = {
+            name: val
+            for (name, val) in bindings.items()
+            if name not in argset
+        }
+        new_body = recurse(e.body, new_bindings)
+        return hash(('Lambda', new_body))
+
+    assert False
+
+
 
 def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
     """
@@ -314,16 +377,30 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
 
     jaxpr = jax.make_jaxpr(f, **kwargs)
     closed_jaxpr = jaxpr(*args)
+    print(closed_jaxpr)
 
     e = jaxpr_to_expr(closed_jaxpr.jaxpr)
-    e = uniquify_names(e)
 
-    e = transform(e, inline_call_of_lambda)
-    e = transform(e, inline_trivial_let)
-    e = transform(e, inline_lambda_of_call)
-    e = to_ssa(e)
-    e = transform(e, detuple_tuple_assignments)
-    e = remove_var_to_var_assignments(e)
+    def signature(e):
+        print('HEV', hash_eval(e))
+        return set.union(freevars(e), {Var('tuple')})
+    
+    global sig
+    sig = signature(e)
+    def check(ex):
+        global sig
+        new_sig = signature(ex)
+        assert sig == new_sig
+        # sig = new_sig - if we wanted to keep going
+
+    e = uniquify_names(e) ; check(e)
+
+    e = transform(e, inline_call_of_lambda); check(e)
+    e = transform(e, inline_trivial_letbody); check(e)
+    e = transform(e, inline_lambda_of_call); check(e)
+    e = to_ssa(e); check(e)
+    e = transform(e, detuple_tuple_assignments); check(e)
+    e = inline_trivial_assignments(e); check(e)
     print(ast.unparse(to_ast(e, "e")))
 
 
@@ -368,9 +445,6 @@ def test_vmap():
     show_jaxpr(foo, args, name="f")
 
     show_jaxpr(vmapgradf, vargs, name="vmapgradf")
-
-
-test_vmap()
 
 # def test_roundtrip():
 #     import os
