@@ -6,13 +6,15 @@ from functools import lru_cache
 
 import jax
 import jaxlib
-if jaxlib.version.__version__ <= '0.4':
-  from jax.experimental import pjit
-  from jax.interpreters import pxla
+if jaxlib.version.__version__ <= "0.4":
+    from jax.experimental import pjit
+    from jax.interpreters import pxla
+    import jax.core as jaxcore
 else:
-  import jax._src
-  #import jax._src.core
-
+    import jax._src
+    import jax._src.core as jaxcore
+    from jax._src import pjit
+    import jaxlib.xla_extension as xla_ext
 
 import jaxlib.xla_extension as xla_ext
 
@@ -215,11 +217,22 @@ def show_jaxpr(
         print(
             f"""
 # show_jaxpr {f}
+from numpy import float32,int32
 from jax.lax import *
 from jax.lax import transpose_p
 import jax.numpy as jnp
-from numpy import float32,int32
-from jax.interpreters.xla import xla_call_p
+import jax
+import jaxlib
+if jaxlib.version.__version__ <= "0.4":
+    from jax.experimental import pjit
+    from jax.interpreters import pxla
+    from jax.interpreters.xla import xla_call_p
+    import jax.core as jaxcore
+else:
+    import jax._src
+    import jax._src.core as jaxcore
+    from jax._src import pjit
+    import jaxlib.xla_extension as xla_ext
 
 add_any_p = add_p
 
