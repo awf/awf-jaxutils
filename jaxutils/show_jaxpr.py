@@ -5,17 +5,17 @@ import numpy as np
 
 import jax
 import jaxlib
+import jaxlib.xla_extension as xla_ext
+
 if jaxlib.version.__version__ <= "0.4":
     from jax.experimental import pjit
-    from jax.interpreters import pxla
+    xla_call_p = jax.interpreters.xla.xla_call_p
     import jax.core as jaxcore
 else:
     import jax._src
     import jax._src.core as jaxcore
     from jax._src import pjit
-    import jaxlib.xla_extension as xla_ext
-
-import jaxlib.xla_extension as xla_ext
+    xla_call_p = None
 
 
 def cat(xs):
@@ -175,7 +175,7 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             new_params[key] = jax.core.Literal(n, None)
 
         primname = eqn.primitive.name + "_p.bind"
-        if False and eqn.primitive is jax.interpreters.xla.xla_call_p:
+        if eqn.primitive is xla_call_p:
             # TODO Handle xla_call specially - essentially erase it.  TODO: do we ever need to preserve the xla_call annotations?
             callee = new_params["call_jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
@@ -221,12 +221,14 @@ if jaxlib.version.__version__ <= "0.4":
     from jax.interpreters import pxla
     from jax.interpreters.xla import xla_call_p
     import jax.core as jaxcore
+    DeviceArray = jnp.array
 else:
     import jax._src
     import jax._src.core as jaxcore
     from jax._src import pjit
     import jaxlib.xla_extension as xla_ext
-
+    Array = jnp.array
+    
 add_any_p = add_p
 
 """,
@@ -245,7 +247,6 @@ add_any_p = add_p
     print(
         f"""
 if __name__ == '__main__':
-    Array = jnp.array
     {name}{args}
 """,
         file=file,
