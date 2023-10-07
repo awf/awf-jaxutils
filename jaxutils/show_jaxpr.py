@@ -4,6 +4,15 @@ import re
 import numpy as np
 
 import jax
+import jaxlib
+if jaxlib.version.__version__ <= '0.4':
+  from jax.experimental import pjit
+  from jax.interpreters import pxla
+else:
+  import jax._src
+  #import jax._src.core
+
+
 import jaxlib.xla_extension as xla_ext
 
 
@@ -169,7 +178,7 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             callee = new_params["call_jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
 
-        elif eqn.primitive is jax._src.pjit.pjit_p:
+        elif eqn.primitive is pjit.pjit_p:
             # TODO Handle pjit_p specially - essentially erase it.  TODO: do we ever need to preserve the pjit annotations?
             callee = new_params["jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
@@ -203,6 +212,7 @@ from jax.lax import *
 from jax.lax import transpose_p
 import jax.numpy as jnp
 from numpy import float32,int32
+from jax.interpreters.xla import xla_call_p
 
 add_any_p = add_p
 
