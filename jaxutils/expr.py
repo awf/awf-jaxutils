@@ -1,8 +1,11 @@
 import sys
+import enum
 from dataclasses import dataclass
 from beartype import beartype
 from beartype.typing import List, Set, Any, Tuple, Dict, List, Callable
 from pprint import pprint
+
+import numpy # TODO just needed once
 
 name_id = 0
 
@@ -391,10 +394,8 @@ def to_ast(e, name):
     e = uniquify_names(e)
     assignments = []
     expr = to_ast_aux(e, assignments)
-    assignments += [ast.Return(expr)]
-    args = to_ast_args(list(freevars(e)))
-    a = to_ast_FunctionDef(name, args, assignments)
-    a = ast.Module(body=[a], type_ignores=[])
+    assignments += [ast.Assign([ast.Name(name, ast.Store())], expr)]
+    a = ast.Module(body=assignments, type_ignores=[])
     ast.fix_missing_locations(a)
     return a
 
@@ -412,11 +413,24 @@ def to_ast_args(vars: List[Var]) -> ast.arguments:
         kw_defaults=None,
     )
 
+def to_ast_constant(val):
+        if isinstance(val, tuple):
+            vals = [to_ast_constant(v) for v in val]
+            return ast.Tuple(vals, ast.Load())
+
+        if isinstance(val, enum.Enum):
+            # TODO Ew, should probably make an Attribute
+            return ast.Name(type(val).__name__ + '.' + val.name)
+
+        # TODO a bit ugly
+        scalar_types = (str, bytes, bool, int, float, complex, numpy.dtype, numpy.number)
+        #assert val is None or isinstance(val, scalar_types)
+        return ast.Constant(value=val, kind=None)
 
 def to_ast_aux(e, assignments):
     if e.isConst:
-        return ast.Constant(value=e.val, kind=None)
-
+        return to_ast_constant(e.val)
+    
     if e.isVar:
         return ast.Name(e.name, ast.Load())
 
@@ -563,8 +577,9 @@ def expr_for(f: Callable) -> Expr:
     return from_ast(a)
 
 
-def expr_to_python_code(e: Expr) -> str:
-    return astunparse.unparse(to_ast(e, "e"))
+def expr_to_python_code(e: Expr, name: str) -> str:
+    as_ast = to_ast(e, name)
+    return astunparse.unparse(as_ast)
 
 
 def eval_expr(e: Expr, args, bindings):

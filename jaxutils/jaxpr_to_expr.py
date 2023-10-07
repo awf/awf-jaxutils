@@ -2,6 +2,8 @@ import types
 import sys
 import re
 import numpy as np
+import itertools
+
 from beartype.typing import Callable, Optional, Any, Dict, List
 from beartype import beartype
 
@@ -25,7 +27,13 @@ import jax.numpy as jnp
 
 from jaxutils.expr import Expr, Var, Const, Lambda, Let, Call
 
-from jaxutils.expr import to_ast, freevars, uniquify_names, mkvars, transform
+from jaxutils.expr import (
+    freevars,
+    uniquify_names,
+    mkvars,
+    transform,
+    expr_to_python_code,
+)
 
 import ast
 
@@ -50,8 +58,8 @@ def toExpr(x) -> Expr:
         x,
         (
             tuple,
-            jax.lax.GatherScatterMode,
             jax.lax.GatherDimensionNumbers,
+            jax.lax.GatherScatterMode,
             str,
             bool,
             int,
@@ -73,11 +81,19 @@ def toExpr(x) -> Expr:
         return jaxpr_to_expr(x.jaxpr)
 
     if isinstance(x, jaxcore.Var):
-        return Var(f"v_{x.count:02d}{x.suffix}")
+        return Var(f"v_{x.count+11}{x.suffix}")
 
     # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
     # Explicitly add verified cases to
     assert False, f"Check {type(x)} shouldn't be transformed [{repr(x)}]"
+
+
+def kwargs_to_dict_call(dict):
+    if not dict:
+        return []
+
+    dict_pairs = [[Const(key), val] for key, val in dict.items()]
+    return [Call(Var("jaxutils.p2d"), list(itertools.chain(*dict_pairs)))]
 
 
 translators: Dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
@@ -96,14 +112,20 @@ def translate_pjit(
     keep_unused=False,
     inline=False,
 ):
-    if not PJIT_PASSTHRU:
-        return Call(Var("pjit"), [jaxpr] + list(*args))
-
-    if unspecified(in_shardings.val) and unspecified(out_shardings.val):
-        return Call(jaxpr, list(*args))
+    # Elide the call if the shardings are unspecified
+    if (
+        PJIT_PASSTHRU
+        and unspecified(in_shardings.val)
+        and unspecified(out_shardings.val)
+    ):
+        return Call(jaxpr, args)
 
 
 translators[pjit.pjit_p] = translate_pjit
+
+translators[jax.lax.scatter_add_p] = lambda *args, **kwargs: Call(
+    Var("scatter_add_p.bind"), list(*args) + kwargs_to_dict_call(kwargs)
+)
 
 
 def jaxpr_to_expr(jaxpr) -> Lambda:
@@ -115,7 +137,7 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
     body = mkTuple([toExpr(v) for v in jaxpr.outvars])
 
     for cv in reversed(jaxpr.constvars):
-        body = Let(toExpr(cv), Const(cv.aval), body)
+        body = Let([toExpr(cv)], Const(cv.aval), body)
 
     for eqn in reversed(jaxpr.eqns):
         new_params = {key: toExpr(val) for key, val in eqn.params.items()}
@@ -126,8 +148,8 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
             val = translators[eqn.primitive](args, **new_params)
 
         if val is None:
-            params = [Call(Var(key + "="), [val]) for key, val in new_params.items()]
-            val = Call(Var(eqn.primitive.name), args + params)
+            params = kwargs_to_dict_call(new_params)
+            val = Call(Var(eqn.primitive.name + "_p.bind"), args + params)
 
         vars = map(toExpr, eqn.outvars)
         body = Let([*vars], val, body)
@@ -203,35 +225,35 @@ def detuple_tuple_assignments(e: Expr) -> Expr:
             return new_body
 
 
-def to_ssa(e):
+def to_anf(e):
     e = uniquify_names(e)
     assignments = []
-    expr = to_ssa_aux(e, assignments)
+    expr = to_anf_aux(e, assignments)
     # now rip through assignments, making Lets
     for vars, val in reversed(assignments):
         expr = Let(vars, val, expr)
     return expr
 
 
-def to_ssa_aux(e, assignments):
+def to_anf_aux(e, assignments):
     if e.isConst or e.isVar:
         return e
 
     if e.isLet:
-        new_val = to_ssa_aux(e.val, assignments)
+        new_val = to_anf_aux(e.val, assignments)
         inner_assignments = []
-        abody = to_ssa_aux(e.body, inner_assignments)
+        abody = to_anf_aux(e.body, inner_assignments)
         assign = (e.vars, new_val)
         assignments += [assign]
         assignments += inner_assignments
         return abody
 
     if e.isLambda:
-        return Lambda(e.args, to_ssa(e.body))
+        return Lambda(e.args, to_anf(e.body))
 
     if e.isCall:
-        new_f = to_ssa_aux(e.f, assignments)
-        new_args = [to_ssa_aux(arg, assignments) for arg in e.args]
+        new_f = to_anf_aux(e.f, assignments)
+        new_args = [to_anf_aux(arg, assignments) for arg in e.args]
         return Call(new_f, new_args)
 
     assert False
@@ -323,8 +345,6 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
 
     jaxpr = jax.make_jaxpr(f, **kwargs)
     closed_jaxpr = jaxpr(*args)
-    print(closed_jaxpr)
-
     e = jaxpr_to_expr(closed_jaxpr.jaxpr)
 
     def signature(e):
@@ -348,15 +368,44 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
     check(e)
     e = transform(inline_lambda_of_call, e)
     check(e)
-    e = to_ssa(e)
+    e = to_anf(e)
     check(e)
     e = transform(detuple_tuple_assignments, e)
     check(e)
-    print(unparse(to_ast(e, "e")))
     e = inline_trivial_assignments(e)
-    print(unparse(to_ast(e, "e")))
     check(e)
-    print(unparse(to_ast(e, "e")))
+    body_code = expr_to_python_code(e, name)
+
+    if add_decls:
+        print(
+            f"""
+# show_jaxpr {f}
+from numpy import float32,int32
+from jax.lax import *
+from jax.lax import transpose_p
+import jax.numpy as jnp
+import jax
+import jaxlib
+if jaxlib.version.__version__ <= "0.4":
+    from jax.experimental import pjit
+    from jax.interpreters import pxla
+    from jax.interpreters.xla import xla_call_p
+    import jax.core as jaxcore
+    DeviceArray = jnp.array
+else:
+    import jax._src
+    import jax._src.core as jaxcore
+    from jax._src import pjit
+    import jaxlib.xla_extension as xla_ext
+    Array = jnp.array
+    
+add_any_p = add_p
+
+""",
+            file=file,
+        )
+
+    print(body_code, file=file)
 
 
 def test_basic():
@@ -402,66 +451,66 @@ def test_vmap():
     show_jaxpr(vmapgradf, vargs, name="vmapgradf")
 
 
-# def test_roundtrip():
-#     import os
+def test_roundtrip():
+    import os
 
-#     def foo(p, x):
-#         x = jax.numpy.matmul(x, p * x.T)
-#         return (x + x[3]).std()
+    def foo(p, x):
+        x = jax.numpy.matmul(x, p * x.T)
+        return (x + x[3]).std()
 
-#     gradf = jax.grad(foo, argnums=1)
-#     vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
+    gradf = jax.grad(foo, argnums=1)
+    vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
 
-#     f = vmapgradf
+    f = vmapgradf
 
-#     prng = jax.random.PRNGKey(42)
-#     args = (2.2, jax.random.normal(prng, (3, 2, 5)))
+    prng = jax.random.PRNGKey(42)
+    args = (2.2, jax.random.normal(prng, (3, 2, 5)))
 
-#     print("f(args)=")
-#     print(f(*args))
+    print("f(args)=")
+    print(f(*args))
 
-#     # Save to file
-#     fn = "tmp/show_jaxpr_jaxpr.py"
-#     with open(fn, "w") as file:
-#         show_jaxpr(f, args, name="f", file=file, add_decls=True)
+    # Save to file
+    fn = "tmp/show_jaxpr_jaxpr.py"
+    with open(fn, "w") as file:
+        show_jaxpr(f, args, name="f", file=file, add_decls=True)
 
-#     os.system(f"black {fn}")
+    os.system(f"black {fn}")
 
-#     # Load from file
-#     import importlib.util
+    # Load from file
+    import importlib.util
 
-#     module_name = "show_jaxpr_roundtrip"
-#     spec = importlib.util.spec_from_file_location(module_name, fn)
-#     module = importlib.util.module_from_spec(spec)
-#     sys.modules[module_name] = module
-#     spec.loader.exec_module(module)
+    module_name = "show_jaxpr_roundtrip"
+    spec = importlib.util.spec_from_file_location(module_name, fn)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
 
-#     # Check rountrip: does module.f give the same result?
-#     assert jnp.allclose(module.f(*args), f(*args))
+    # Check rountrip: does module.f give the same result?
+    assert jnp.allclose(module.f(*args), f(*args))
 
-#     # Save again
-#     fn2 = "tmp/show_jaxpr_roundtrip.py"
-#     with open(fn2, "w") as file2:
-#         show_jaxpr(module.f, args, file=file2, add_decls=True)
+    # Save again
+    fn2 = "tmp/show_jaxpr_roundtrip.py"
+    with open(fn2, "w") as file2:
+        show_jaxpr(module.f, args, file=file2, add_decls=True)
 
-#     os.system(f"black {fn2}")
+    os.system(f"black {fn2}")
 
-#     # Reload for 2nd roundtrip to test string equality
-#     module_name = "show_jaxpr_roundtrip2"
-#     spec = importlib.util.spec_from_file_location(module_name, fn2)
-#     module2 = importlib.util.module_from_spec(spec)
-#     sys.modules[module_name] = module2
-#     spec.loader.exec_module(module2)
+    # Reload for 2nd roundtrip to test string equality
+    module_name = "show_jaxpr_roundtrip2"
+    spec = importlib.util.spec_from_file_location(module_name, fn2)
+    module2 = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module2
+    spec.loader.exec_module(module2)
 
-#     assert jnp.allclose(module.f(*args), f(*args))
+    assert jnp.allclose(module.f(*args), f(*args))
 
-#     # Sand save 2nd roundtrip
-#     fn3 = "tmp/show_jaxpr_roundtrip2.py"
-#     with open(fn3, "w") as file3:
-#         show_jaxpr(module2.f, args, file=file3, add_decls=True)
+    # Sand save 2nd roundtrip
+    fn3 = "tmp/show_jaxpr_roundtrip2.py"
+    with open(fn3, "w") as file3:
+        show_jaxpr(module2.f, args, file=file3, add_decls=True)
 
-#     os.system(f"black {fn3}")
+    os.system(f"black {fn3}")
 
-#     print(f"code --diff {fn2} {fn3} # Do view diffs in vs code")
+    print(f"code --diff {fn2} {fn3} # Do view diffs in vs code")
 
-# test_roundtrip()
+test_roundtrip()
