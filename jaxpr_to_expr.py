@@ -239,7 +239,7 @@ def inline_trivial_assignments(e):
 
 
 @beartype
-def inline_trivial_assignments_aux(e: Expr, translations: dict[str, Expr]):
+def inline_trivial_assignments_aux(e: Expr, translations: dict[Var, Expr]):
     # let a = b in body -> body[a->b]
 
     recurse = inline_trivial_assignments_aux
@@ -248,29 +248,32 @@ def inline_trivial_assignments_aux(e: Expr, translations: dict[str, Expr]):
         return e
 
     if e.isVar:
-        return translations.get(e.name, e)
+        return translations.get(e, e)
 
     if e.isLet:
-        # let vars = val in body
-        if len(e.vars) == 1 and is_trivial(e.val):
-            argset = {v.name for v in e.vars}
-            new_translations = {
-                name: val for (name, val) in translations.items() if name not in argset
-            }
+        new_val = recurse(e.val, translations)
 
-            assert e.vars[0].name not in new_translations
-            new_translations[e.vars[0].name] = e.val
+        # Remove our vars from translations
+        argset = set(e.vars)
+        new_translations = {
+            var:val for (var,val) in translations.items() if var not in argset
+        }
+        assert all(v not in new_translations for v in e.vars)
+
+        # let vars = val in body
+        if len(e.vars) == 1 and is_trivial(new_val):
+            new_translations[e.vars[0]] = new_val
             return recurse(e.body, new_translations)
         else:
-            new_val = recurse(e.val, translations)
-            new_body = recurse(e.body, translations)
+            new_body = recurse(e.body, new_translations)
             return Let(e.vars, new_val, new_body)
 
     if e.isLambda:
-        argset = {v.name for v in e.args}
+        argset = set(e.args)
         new_translations = {
-            name: val for (name, val) in translations.items() if name not in argset
+            var:val for (var,val) in translations.items() if var not in argset
         }
+        assert all(v not in new_translations for v in e.args)
         new_body = recurse(e.body, new_translations)
         return Lambda(e.args, new_body)
 
@@ -290,72 +293,6 @@ def test_inline_trivial_assignments():
     expect = Call(b, [Call(c, [c, b, c])])
     assert out == expect
 
-
-@beartype
-def run_eval(e: Expr, bindings: dict[Var, Any]) -> Any:
-    recurse = run_eval
-
-    if e.isConst:
-        return e.val
-
-    if e.isVar:
-        return bindings[e]
-
-    if e.isCall:
-        new_f = recurse(e.f, bindings)
-        new_args = [recurse(arg, bindings) for arg in e.args]
-        assert isinstance(new_f, Callable)
-        return new_f(*new_args)
-
-    if e.isLet:
-        # let vars = val in body
-        argset = {v.name for v in e.vars}
-        new_bindings = {
-            name: val for (name, val) in bindings.items() if name not in argset
-        }
-
-        tupval = recurse(e.val, bindings)
-        assert isinstance(tupval, tuple)
-
-        for var, val in zip(e.vars, tupval):
-            new_bindings[var] = val
-
-        return recurse(e.body, new_bindings)
-
-    if e.isLambda:
-
-        def runLambda(e, vals, bindings):
-            argset = {v.name for v in e.args}
-            new_bindings = {
-                name: val for (name, val) in bindings.items() if name not in argset
-            }
-            for var, val in zip(e.args, vals):
-                new_bindings[var] = val
-
-            return recurse(e.body, new_bindings)
-
-        return lambda vals: runLambda(e, vals, bindings)
-
-    assert False
-
-
-def test_eval():
-    import operator
-
-    a, b, c = mkvars("a,b,c")
-    f_tuple, f_add = mkvars("tuple, add")
-    f_defs = {
-        f_add: operator.add,
-        f_tuple: lambda *args: tuple(args),
-    }
-
-    v = run_eval(Call(f_add, [Const(2), Const(3)]), f_defs)
-    assert v == 5
-
-    v = run_eval(
-        Let([a, b], Call(f_tuple, [Const(2), Const(3)]), Call(f_add, [a, b])), f_defs
-    )
-    assert v == 5
 
 
 
@@ -404,7 +341,9 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
     check(e)
     e = transform(detuple_tuple_assignments, e)
     check(e)
+    print(ast.unparse(to_ast(e, "e")))
     e = inline_trivial_assignments(e)
+    print(ast.unparse(to_ast(e, "e")))
     check(e)
     print(ast.unparse(to_ast(e, "e")))
 
