@@ -1,3 +1,4 @@
+import sys
 from dataclasses import dataclass
 from beartype import beartype
 from beartype.typing import List, Set, Any, Tuple, Type, List, Callable
@@ -58,7 +59,6 @@ class Expr:
         return isinstance(self, Let)
 
 
-
 def exprclass(klass, **kwargs):
     """
     Decorator to simplify declaring expr subclasses.
@@ -104,6 +104,7 @@ def mkvars(s: str) -> Tuple[Var]:
     s = s.replace(" ", "")
     return [Var(s) for s in s.split(",")]
 
+
 def transform(transformer: Callable[[Expr], Expr], e: Expr):
     recurse = lambda e: transform(transformer, e)
 
@@ -123,7 +124,6 @@ def transform(transformer: Callable[[Expr], Expr], e: Expr):
 
     # And pass self to the transformer, with updated children
     return transformer(e) or e
-
 
 
 def freevars(e: Expr) -> set[Var]:
@@ -220,11 +220,13 @@ def test_let_to_lambda():
 
     visit(l, check)
 
-def uniquify_names(e : Expr):
-    translations = {v.name:v.name for v in freevars(e)}
+
+def uniquify_names(e: Expr):
+    translations = {v.name: v.name for v in freevars(e)}
     return uniquify_names_aux(e, translations)
 
-def uniquify_names_aux(e : Expr, translations) -> Expr:
+
+def uniquify_names_aux(e: Expr, translations) -> Expr:
     # foo(let x = 2 in f(x), x)
     #  -> foo(let x_new = 2 in f(x_new), x)
     # i.e. a let which binds a var which is already in scope will
@@ -235,16 +237,16 @@ def uniquify_names_aux(e : Expr, translations) -> Expr:
     # Vars that come newly in scope should be translated to themselves
     if e.isConst:
         return e
-    
+
     if e.isVar:
         return Var(translations.get(e.name, e.name))
-        
+
     if e.isCall:
         return Call(
             uniquify_names_aux(e.f, translations),
-             [uniquify_names_aux(arg, translations) for arg in e.args]
+            [uniquify_names_aux(arg, translations) for arg in e.args],
         )
-    
+
     assert e.isLet or e.isLambda
 
     if e.isLet:
@@ -259,7 +261,7 @@ def uniquify_names_aux(e : Expr, translations) -> Expr:
         # If its name is already in translations, it is clashing,
         # so in the body of this let, it will need a new name
         if var in new_translations:
-            newname = 't_' + get_new_name()
+            newname = "t_" + get_new_name()
         else:
             newname = var
         new_translations[var] = newname
@@ -274,9 +276,9 @@ def uniquify_names_aux(e : Expr, translations) -> Expr:
         new_body = uniquify_names_aux(e.body, new_translations)
         return Lambda(new_vars, new_body)
 
+
 def test_uniquify_names():
-    a,b,c,d = mkvars('a,b,c,d')
-    
+    a, b, c, d = mkvars("a,b,c,d")
 
     e = Let([a], a, Let([a], b, Call(b, [a, b])))
     pprint(e)
@@ -287,9 +289,92 @@ def test_uniquify_names():
     assert out.body.vars[0] != a
     assert out.body.vars[0] != out.vars[0]
 
+######### Eval
+
+def run_eval(e: Expr, bindings: dict[str, Any]) -> Any:
+    new_bindings = {
+        Var(key):val for key,val in bindings.items()
+    }
+    # Check all the freevars have been bound
+    for v in freevars(e):
+      assert v in new_bindings
+
+    return run_eval_aux(e, new_bindings)
+
+@beartype
+def run_eval_aux(e: Expr, bindings: dict[Var, Any]) -> Any:
+    recurse = run_eval_aux
+
+    if e.isConst:
+        return e.val
+
+    if e.isVar:
+        return bindings[e]
+
+    if e.isCall:
+        new_f = recurse(e.f, bindings)
+        new_args = [recurse(arg, bindings) for arg in e.args]
+        assert isinstance(new_f, Callable)
+        return new_f(*new_args)
+
+    if e.isLet:
+        # let vars = val in body
+        argset = set(e.vars)
+        new_bindings = {
+            var:val for (var, val) in bindings.items() if var not in argset
+        }
+
+        tupval = recurse(e.val, bindings)
+        if len(e.vars) > 1:
+          assert isinstance(tupval, tuple)
+        else:
+          tupval = (tupval,)
+
+        for var, val in zip(e.vars, tupval):
+            new_bindings[var] = val
+
+        return recurse(e.body, new_bindings)
+
+    if e.isLambda:
+
+        def runLambda(e, vals, bindings):
+            argset = {v.name for v in e.args}
+            new_bindings = {
+                name: val for (name, val) in bindings.items() if name not in argset
+            }
+            for var, val in zip(e.args, vals):
+                new_bindings[var] = val
+
+            return recurse(e.body, new_bindings)
+
+        return lambda *vals: runLambda(e, vals, bindings)
+
+    assert False
+
+
+def test_eval():
+    import operator
+
+    a, b, c = mkvars("a,b,c")
+    f_tuple, f_add = mkvars("tuple, add")
+    f_defs = {
+        'add': operator.add,
+        'tuple': lambda *args: tuple(args),
+    }
+
+    v = run_eval(Call(f_add, [Const(2), Const(3)]), f_defs)
+    assert v == 5
+
+    v = run_eval(
+        Let([a, b], Call(f_tuple, [Const(2), Const(3)]), Call(f_add, [a, b])), f_defs
+    )
+    assert v == 5
+
+
 ######### AST
 
 import ast
+
 
 def to_ast_FunctionDef(name, args, body):
     return ast.FunctionDef(name=name, args=args, body=body, decorator_list=[], lineno=0)
@@ -313,7 +398,6 @@ def to_ast_args(vars: List[Var]) -> ast.arguments:
     return ast.arguments(
         args=aargs, defaults=[], posonlyargs=[], kwonlyargs=[], kw_defaults=[]
     )
-
 
 
 def to_ast_aux(e, assignments):
@@ -340,7 +424,7 @@ def to_ast_aux(e, assignments):
         inner_assignments = []
         abody = to_ast_aux(e.body, inner_assignments)
         inner_assignments += [ast.Return(abody)]
-        name = 'f' + get_new_name()
+        name = "f" + get_new_name()
         aargs = to_ast_args(e.args)
         fdef = to_ast_FunctionDef(name, aargs, inner_assignments)
         assignments += [fdef]
@@ -353,16 +437,10 @@ def to_ast_aux(e, assignments):
 
     assert False
 
-def foo():
-    a,b = 123
-
 
 def test_ast():
-    # To see what bits of AST should be
-    # print(ast.dump(ast.parse(inspect.getsource(foo)), indent=2))
-
-    a,b = mkvars("a,b")
-    e = Let([a,b], Const(123), Const(234))
+    a, b = mkvars("a,b")
+    e = Let([a, b], Const(123), Const(234))
     pprint(e)
     a = to_ast(e, "e")
     print(ast.unparse(a))
@@ -373,3 +451,109 @@ def test_ast():
 
     # code = compile(a, 'bar', 'exec')
     # exec(code)
+
+
+def from_ast(a: ast.AST):
+    recurse = from_ast
+
+    if isinstance(a, ast.Module):
+        assert len(a.body) == 1
+        return recurse(a.body[0])
+
+    if isinstance(a, ast.arguments):
+        assert not a.vararg
+        assert not a.kwonlyargs
+        assert not a.kw_defaults
+        assert not a.kwarg
+        assert not a.defaults
+        if sys.version_info >= (3, 8):
+            assert not a.posonlyargs
+
+        return [Var(arg.arg) for arg in a.args]
+
+    if isinstance(a, ast.FunctionDef):
+        name = Var(a.name)
+        args = recurse(a.args)
+
+        assert isinstance(a.body[-1], ast.Return)
+        body = recurse(a.body[-1].value)
+
+        for stmt in reversed(a.body[:-1]):
+            assert isinstance(stmt, ast.Assign)
+            assert len(stmt.targets) == 1
+            s_vars = stmt.targets[0]
+            if isinstance(s_vars, ast.Tuple):
+                vars = [Var(var.id) for var in s_vars.elts]
+            else:
+                vars = [Var(s_vars.id)]
+            val = recurse(stmt.value)
+            body = Let(vars, val, body)
+
+        return Let([name], Lambda(args, body), name)
+
+    if isinstance(a, ast.Lambda):
+        return Lambda(recurse(a.args), recurse(a.body))
+
+    if isinstance(a, ast.Constant):
+        return Const(a.value)
+
+    # Nodes which encode to Var
+    if isinstance(a, ast.Name):
+        return Var(a.id)
+
+    if isinstance(a, ast.operator):
+        return Var('ast.' + type(a).__name__)
+
+    # Nodes which encode to (Var or Call)
+    if isinstance(a, ast.Attribute):
+        val = recurse(a.value)
+        if val.isVar:
+            # just make it a name
+            return Var(val.name + '.' + a.attr)
+        else:
+            # make it a getattr call.
+            return Call(Var("getattr"), [recurse(a.value), Const(a.attr)])
+
+    # Nodes which encode to Call
+    if isinstance(a, ast.Call):
+        func = recurse(a.func)
+        args = [recurse(arg) for arg in a.args]
+        assert len(a.keywords) == 0
+        return Call(func, args)
+
+    if isinstance(a, ast.Tuple):
+        return Call(Var('tuple'), [recurse(e) for e in a.elts])
+
+    if isinstance(a, ast.BinOp):
+        return Call(recurse(a.op), [recurse(a.left), recurse(a.right)])
+
+    # Fallthru
+    return Const(f"TODO:{type(a)}")
+
+
+def test_ast_to_expr():
+    import inspect
+    import textwrap
+    import jax.numpy as jnp
+
+    def foo(f):
+        a, b = 123, 2
+        c = f * b
+        d = jnp.sin(c)
+        return (lambda x: d + x)(c)
+
+    expected = foo(5)
+
+    a = ast.parse(textwrap.dedent(inspect.getsource(foo)))
+
+    e = from_ast(a)
+    print(ast.unparse(to_ast(e, "e")))
+
+    import operator
+    got = run_eval(Call(e, [Const(5)]), {
+        'ast.Mult':operator.mul,
+        'ast.Add':operator.add,
+        'jnp.sin':jnp.sin,
+        'tuple': lambda *args: tuple(args),
+        })
+    assert expected == got
