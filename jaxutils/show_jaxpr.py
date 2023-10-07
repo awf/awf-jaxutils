@@ -103,7 +103,7 @@ def varstr(x):
 
     # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
     assert isinstance(
-        x, (str, bool, int, jax.lax.GatherDimensionNumbers)
+        x, (str, bool, int, float, jax.lax.GatherDimensionNumbers)
     ), f"Check this shouldn't be transformed [{repr(x)}]"
 
     return repr(x)
