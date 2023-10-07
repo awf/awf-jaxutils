@@ -15,6 +15,7 @@ if jaxlib.version.__version__ <= "0.4":
 else:
     import jax._src
     import jax._src.core as jaxcore
+    from jax._src import pjit
     import jaxlib.xla_extension as xla_ext
 
 from pprint import pprint
