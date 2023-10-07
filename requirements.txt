@@ -1,7 +1,5 @@
 jax
 jaxlib
-astpretty
-prettyprinter
 icecream
 labml
 pytest

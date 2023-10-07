@@ -1,7 +1,7 @@
 import sys
 from dataclasses import dataclass
 from beartype import beartype
-from beartype.typing import List, Set, Any, Tuple, Type, List, Callable
+from beartype.typing import List, Set, Any, Tuple, Dict, List, Callable
 from pprint import pprint
 
 name_id = 0
@@ -126,7 +126,7 @@ def transform(transformer: Callable[[Expr], Expr], e: Expr):
     return transformer(e) or e
 
 
-def freevars(e: Expr) -> set[Var]:
+def freevars(e: Expr) -> Set[Var]:
     if e.isConst:
         return set()
 
@@ -289,20 +289,21 @@ def test_uniquify_names():
     assert out.body.vars[0] != a
     assert out.body.vars[0] != out.vars[0]
 
+
 ######### Eval
 
-def run_eval(e: Expr, bindings: dict[str, Any]) -> Any:
-    new_bindings = {
-        Var(key):val for key,val in bindings.items()
-    }
+
+def run_eval(e: Expr, bindings: Dict[str, Any]) -> Any:
+    new_bindings = {Var(key): val for key, val in bindings.items()}
     # Check all the freevars have been bound
     for v in freevars(e):
-      assert v in new_bindings
+        assert v in new_bindings
 
     return run_eval_aux(e, new_bindings)
 
+
 @beartype
-def run_eval_aux(e: Expr, bindings: dict[Var, Any]) -> Any:
+def run_eval_aux(e: Expr, bindings: Dict[Var, Any]) -> Any:
     recurse = run_eval_aux
 
     if e.isConst:
@@ -321,14 +322,14 @@ def run_eval_aux(e: Expr, bindings: dict[Var, Any]) -> Any:
         # let vars = val in body
         argset = set(e.vars)
         new_bindings = {
-            var:val for (var, val) in bindings.items() if var not in argset
+            var: val for (var, val) in bindings.items() if var not in argset
         }
 
         tupval = recurse(e.val, bindings)
         if len(e.vars) > 1:
-          assert isinstance(tupval, tuple)
+            assert isinstance(tupval, tuple)
         else:
-          tupval = (tupval,)
+            tupval = (tupval,)
 
         for var, val in zip(e.vars, tupval):
             new_bindings[var] = val
@@ -358,8 +359,9 @@ def test_eval():
     a, b, c = mkvars("a,b,c")
     f_tuple, f_add = mkvars("tuple, add")
     f_defs = {
-        'add': operator.add,
-        'tuple': lambda *args: tuple(args),
+        "add": operator.add,
+        "tuple": lambda *args: tuple(args),
+        "getattr": getattr
     }
 
     v = run_eval(Call(f_add, [Const(2), Const(3)]), f_defs)
@@ -374,6 +376,11 @@ def test_eval():
 ######### AST
 
 import ast
+
+if sys.version_info >= (3, 9):
+    astunparse = ast
+else:
+    import astunparse
 
 
 def to_ast_FunctionDef(name, args, body):
@@ -394,15 +401,21 @@ def to_ast(e, name):
 
 @beartype
 def to_ast_args(vars: List[Var]) -> ast.arguments:
-    aargs = [ast.arg(v.name) for v in vars]
+    aargs = [ast.arg(v.name, annotation=None) for v in vars]
     return ast.arguments(
-        args=aargs, defaults=[], posonlyargs=[], kwonlyargs=[], kw_defaults=[]
+        args=aargs,
+        vararg=None,
+        kwarg=None,
+        defaults=[],
+        posonlyargs=[],
+        kwonlyargs=[],
+        kw_defaults=None,
     )
 
 
 def to_ast_aux(e, assignments):
     if e.isConst:
-        return ast.Constant(value=e.val)
+        return ast.Constant(value=e.val, kind=None)
 
     if e.isVar:
         return ast.Name(e.name, ast.Load())
@@ -443,11 +456,11 @@ def test_ast():
     e = Let([a, b], Const(123), Const(234))
     pprint(e)
     a = to_ast(e, "e")
-    print(ast.unparse(a))
+    print(astunparse.unparse(a))
 
     e = _make_e()
     a = to_ast(e, "e")
-    print(ast.unparse(a))
+    print(astunparse.unparse(a))
 
     # code = compile(a, 'bar', 'exec')
     # exec(code)
@@ -502,17 +515,17 @@ def from_ast(a: ast.AST):
         return Var(a.id)
 
     if isinstance(a, ast.operator):
-        return Var('ast.' + type(a).__name__)
+        return Var("ast." + type(a).__name__)
 
     # Nodes which encode to (Var or Call)
     if isinstance(a, ast.Attribute):
+        # if isinstance(a.value, ast.Name):
+        #     # just make it a name
+        #     return Var(val.name + '.' + a.attr)
+        # else:
+        #     # make it a getattr call.
         val = recurse(a.value)
-        if val.isVar:
-            # just make it a name
-            return Var(val.name + '.' + a.attr)
-        else:
-            # make it a getattr call.
-            return Call(Var("getattr"), [recurse(a.value), Const(a.attr)])
+        return Call(Var("getattr"), [val, Const(a.attr)])
 
     # Nodes which encode to Call
     if isinstance(a, ast.Call):
@@ -522,18 +535,43 @@ def from_ast(a: ast.AST):
         return Call(func, args)
 
     if isinstance(a, ast.Tuple):
-        return Call(Var('tuple'), [recurse(e) for e in a.elts])
+        return Call(Var("tuple"), [recurse(e) for e in a.elts])
 
     if isinstance(a, ast.BinOp):
         return Call(recurse(a.op), [recurse(a.left), recurse(a.right)])
 
+    if isinstance(a, ast.Subscript):
+        return Call(Var("ast.Subscript"), [recurse(a.value), recurse(a.slice)])
+    
+    if isinstance(a, ast.Index):
+        return recurse(a.value)
+        
+    if isinstance(a, (ast.ExtSlice, ast.Slice)):
+        # Plan is to overload "ast.Subscript" implementation to handle them all.
+        assert False
+
+
     # Fallthru
-    return Const(f"TODO:{type(a)}")
+    assert False, f"TODO:{type(a)}"
+
+
+def expr_for(f: Callable) -> Expr:
+    import inspect
+    import textwrap
+
+    a = ast.parse(textwrap.dedent(inspect.getsource(f)))
+    return from_ast(a)
+
+
+def expr_to_python_code(e: Expr) -> str:
+    return astunparse.unparse(to_ast(e, "e"))
+
+
+def eval_expr(e: Expr, args, bindings):
+    return run_eval(Call(e, [Const(a) for a in args]), bindings)
 
 
 def test_ast_to_expr():
-    import inspect
-    import textwrap
     import jax.numpy as jnp
 
     def foo(f):
@@ -544,16 +582,51 @@ def test_ast_to_expr():
 
     expected = foo(5)
 
-    a = ast.parse(textwrap.dedent(inspect.getsource(foo)))
-
-    e = from_ast(a)
-    print(ast.unparse(to_ast(e, "e")))
+    e = expr_for(foo)
+    print(expr_to_python_code(e))
 
     import operator
-    got = run_eval(Call(e, [Const(5)]), {
-        'ast.Mult':operator.mul,
-        'ast.Add':operator.add,
-        'jnp.sin':jnp.sin,
-        'tuple': lambda *args: tuple(args),
-        })
+
+    got = eval_expr(
+        e,
+        [5],
+        {
+            "ast.Mult": operator.mul,
+            "ast.Add": operator.add,
+            "jnp": jnp,
+            "tuple": lambda *args: tuple(args),
+            "getattr": getattr,
+        },
+    )
     assert expected == got
+
+
+def test_ast_to_expr2():
+    import jax
+
+    def foo(p, x):
+        x = x @ (p * x.T)
+        return (x + x[3]).std()
+
+    prng = jax.random.PRNGKey(42)
+    args = (2.2, jax.random.normal(prng, (2, 5)))
+
+    expected = foo(*args)
+    print(expected)
+
+    e_foo = expr_for(foo)
+    print(expr_to_python_code(e_foo))
+    import operator
+
+    got = eval_expr(
+        e_foo,
+        args,
+        {
+            "ast.Subscript": lambda a,slice: a[slice],
+            "ast.MatMult": operator.matmul,
+            "ast.Mult": operator.mul,
+            "ast.Add": operator.add,
+            "tuple": lambda *args: tuple(args),
+            'getattr': getattr
+        },
+    )

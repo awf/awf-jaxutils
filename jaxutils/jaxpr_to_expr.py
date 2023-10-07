@@ -2,16 +2,22 @@ import types
 import sys
 import re
 import numpy as np
-from typing import Callable, Optional, Any
+from beartype.typing import Callable, Optional, Any, Dict, List
 from beartype import beartype
 
 import jax
-import jax._src
-import jax._src.core
-from jax._src.interpreters import pxla
-import jaxlib.xla_extension as xla_ext
-from pprint import pprint
+import jaxlib
 
+if jaxlib.version.__version__ <= "0.4":
+    from jax.experimental import pjit
+    from jax.interpreters import pxla
+    import jax.core as jaxcore
+else:
+    import jax._src
+    import jax._src.core as jaxcore
+    import jaxlib.xla_extension as xla_ext
+
+from pprint import pprint
 
 from jax import lax
 import jax.numpy as jnp
@@ -21,6 +27,13 @@ from jaxutils.expr import Expr, Var, Const, Lambda, Let, Call
 from jaxutils.expr import to_ast, freevars, uniquify_names, mkvars, transform
 
 import ast
+
+if sys.version_info >= (3, 9):
+    unparse = ast.unparse
+else:
+    import astunparse
+
+    unparse = astunparse.unparse
 
 
 def tree_all(t):
@@ -32,7 +45,7 @@ def unspecified(x):
 
 
 def toExpr(x) -> Expr:
-    if isinstance(
+    if x is None or isinstance(
         x,
         (
             tuple,
@@ -44,22 +57,21 @@ def toExpr(x) -> Expr:
             np.float32,
             np.int32,
             float,
-            types.NoneType,
             np.dtype,
         ),
     ):
         return Const(x)
 
-    if isinstance(x, jax._src.core.Literal):
+    if isinstance(x, jaxcore.Literal):
         return Const(x.val)
 
-    if isinstance(x, jax.core.Jaxpr):
+    if isinstance(x, jaxcore.Jaxpr):
         return jaxpr_to_expr(x)
 
-    if isinstance(x, jax.core.ClosedJaxpr):
+    if isinstance(x, jaxcore.ClosedJaxpr):
         return jaxpr_to_expr(x.jaxpr)
 
-    if isinstance(x, jax.core.Var):
+    if isinstance(x, jaxcore.Var):
         return Var(f"v_{x.count:02d}{x.suffix}")
 
     # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
@@ -67,7 +79,7 @@ def toExpr(x) -> Expr:
     assert False, f"Check {type(x)} shouldn't be transformed [{repr(x)}]"
 
 
-translators: dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
+translators: Dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
 
 PJIT_PASSTHRU = True
 
@@ -90,7 +102,7 @@ def translate_pjit(
         return Call(jaxpr, list(*args))
 
 
-translators[jax._src.pjit.pjit_p] = translate_pjit
+translators[pjit.pjit_p] = translate_pjit
 
 
 def jaxpr_to_expr(jaxpr) -> Lambda:
@@ -123,7 +135,7 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
     return Lambda(args, body)
 
 
-def mkTuple(es: list[Expr]) -> Expr:
+def mkTuple(es: List[Expr]) -> Expr:
     if len(es) == 1:
         return es[0]
     else:
@@ -239,7 +251,7 @@ def inline_trivial_assignments(e):
 
 
 @beartype
-def inline_trivial_assignments_aux(e: Expr, translations: dict[Var, Expr]):
+def inline_trivial_assignments_aux(e: Expr, translations: Dict[Var, Expr]):
     # let a = b in body -> body[a->b]
 
     recurse = inline_trivial_assignments_aux
@@ -256,7 +268,7 @@ def inline_trivial_assignments_aux(e: Expr, translations: dict[Var, Expr]):
         # Remove our vars from translations
         argset = set(e.vars)
         new_translations = {
-            var:val for (var,val) in translations.items() if var not in argset
+            var: val for (var, val) in translations.items() if var not in argset
         }
         assert all(v not in new_translations for v in e.vars)
 
@@ -271,7 +283,7 @@ def inline_trivial_assignments_aux(e: Expr, translations: dict[Var, Expr]):
     if e.isLambda:
         argset = set(e.args)
         new_translations = {
-            var:val for (var,val) in translations.items() if var not in argset
+            var: val for (var, val) in translations.items() if var not in argset
         }
         assert all(v not in new_translations for v in e.args)
         new_body = recurse(e.body, new_translations)
@@ -292,8 +304,6 @@ def test_inline_trivial_assignments():
     pprint(out)
     expect = Call(b, [Call(c, [c, b, c])])
     assert out == expect
-
-
 
 
 def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
@@ -341,11 +351,11 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
     check(e)
     e = transform(detuple_tuple_assignments, e)
     check(e)
-    print(ast.unparse(to_ast(e, "e")))
+    print(unparse(to_ast(e, "e")))
     e = inline_trivial_assignments(e)
-    print(ast.unparse(to_ast(e, "e")))
+    print(unparse(to_ast(e, "e")))
     check(e)
-    print(ast.unparse(to_ast(e, "e")))
+    print(unparse(to_ast(e, "e")))
 
 
 def test_basic():
@@ -369,6 +379,7 @@ def test_basic():
     #     gradf, args, is_python_returned=True
     # )
     # print(python_code)
+
 
 def test_vmap():
     def foo(p, x):

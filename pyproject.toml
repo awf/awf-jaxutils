@@ -30,7 +30,8 @@ testpaths = [
 python_files = [
     "vjp.py",
     "show_jaxpr.py",
-    "expr.py"
+    "expr.py",
+    "jaxpr_to_expr.py"
 ]
 
 [tool.setuptools]

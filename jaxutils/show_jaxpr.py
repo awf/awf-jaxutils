@@ -5,6 +5,15 @@ import numpy as np
 from functools import lru_cache
 
 import jax
+import jaxlib
+if jaxlib.version.__version__ <= '0.4':
+  from jax.experimental import pjit
+  from jax.interpreters import pxla
+else:
+  import jax._src
+  #import jax._src.core
+
+
 import jaxlib.xla_extension as xla_ext
 import jax._src as jaxsrc
 from jax.extend import core as jaxcore
@@ -196,11 +205,13 @@ def print_jaxpr_as_python(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             # Add val to new_params
             new_params[key] = val
 
-        if eqn.primitive is jaxsrc.pjit.pjit_p:
+        if False and eqn.primitive is jax.interpreters.xla.xla_call_p:
+            # TODO Handle xla_call specially - essentially erase it.  TODO: do we ever need to preserve the xla_call annotations?
+            callee = new_params["call_jaxpr"]
+            translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
 
-            # pjits are all of the form pjit(func_var, args).
-            # Emit as func_var(args)
-            # TODO: do we ever need to preserve the pjit annotations?
+        elif eqn.primitive is pjit.pjit_p:
+            # TODO Handle pjit_p specially - essentially erase it.  TODO: do we ever need to preserve the pjit annotations?
             callee = new_params["jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
 
