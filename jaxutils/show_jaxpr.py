@@ -6,15 +6,17 @@ from functools import lru_cache
 
 import jax
 import jaxlib
+import jaxlib.xla_extension as xla_ext
+
 if jaxlib.version.__version__ <= "0.4":
     from jax.experimental import pjit
-    from jax.interpreters import pxla
+
+    xla_call_p = jax.interpreters.xla.xla_call_p
     import jax.core as jaxcore
 else:
     import jax._src
     import jax._src.core as jaxcore
     from jax._src import pjit
-    import jaxlib.xla_extension as xla_ext
 
 import jaxlib.xla_extension as xla_ext
 import jax._src as jaxsrc
