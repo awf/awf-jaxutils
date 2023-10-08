@@ -7,6 +7,8 @@ import itertools
 from beartype.typing import Callable, Optional, Any, Dict, List
 from beartype import beartype
 
+import pytest
+
 import jax
 import jaxlib
 
@@ -14,27 +16,29 @@ if jaxlib.version.__version__ <= "0.4":
     from jax.experimental import pjit
     from jax.interpreters import pxla
     import jax.core as jaxcore
+
+    xla_call_p = jax.interpreters.xla.xla_call_p
 else:
     import jax._src
     import jax._src.core as jaxcore
     from jax._src import pjit
     import jaxlib.xla_extension as xla_ext
 
+    xla_call_p = None
+
 from pprint import pprint
 
 from jax import lax
 import jax.numpy as jnp
 
-from jaxutils.expr import Expr, Var, Const, Lambda, Let, Call
+import jaxutils
+from jaxutils.expr import Expr, Var, Const, Lambda, Let, Call, mkTuple
 
 from jaxutils.expr import (
     dictassign,
-    freevars,
-    uniquify_names,
-    mkvars,
-    transform,
+    optimize,
     to_ast,
-    astunparse
+    astunparse,
 )
 
 import ast
@@ -55,7 +59,124 @@ def unspecified(x):
     return tree_all(jax.tree_map(jax._src.sharding_impls.is_unspecified, x))
 
 
-def toExpr(x) -> Expr:
+
+
+def kwargs_to_dict_call(dict):
+    if not dict:
+        return []
+
+    dict_pairs = [[Const(key), val] for key, val in dict.items()]
+    return [Call(Var("**jaxutils_p2d"), list(itertools.chain(*dict_pairs)))]
+
+
+translators: Dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
+
+translate_pjit_passthru = True
+
+
+@dictassign(translators, pjit.pjit_p)
+def _(
+    *args,
+    jaxpr=None,
+    in_shardings=None,
+    out_shardings=None,
+    resource_env=None,
+    donated_invars=None,
+    name="",
+    keep_unused=False,
+    inline=False,
+):
+    # Elide the call if the shardings are unspecified
+    if (
+        translate_pjit_passthru
+        and unspecified(in_shardings.val)
+        and unspecified(out_shardings.val)
+    ):
+        return Call(jaxpr, list(args))
+
+
+@dictassign(translators, jax.lax.scatter_add_p)
+def _(*args, **kwargs):
+    #    v_35 = scatter_add(
+    #         v_34,
+    #         v_21,
+    #         v_32,
+    #         ScatterDimensionNumbers(
+    #             update_window_dims=(0, 1),
+    #             inserted_window_dims=(1,),
+    #             scatter_dims_to_operand_dims=(1,),
+    #         ),
+    #     **jaxutils_p2d(
+    #         "indices_are_sorted",
+    #         True,
+    #         "unique_indices",
+    #         True,
+    #         "mode",
+    #         GatherScatterMode.PROMISE_IN_BOUNDS,
+    #     ),
+    # )
+
+    # Check that update_jaxpr is just an add, else how do we convert?
+    # The call to optimize is because update_jaxpr is sometimes of the form
+    #    lambda a,b: let tmp = add(a,b) in tmp
+    # which simplifies to 
+    #    add
+    # Note that if this assert fails because update_jaxpr is some large complicated thing
+    # be aware of possible quadratic complexity in calling optimize
+    update_jaxpr = kwargs.pop('update_jaxpr')
+    assert optimize(update_jaxpr) == Var('add_p.bind')
+
+    dimension_numbers = kwargs.pop('dimension_numbers')
+
+    # Hope update_consts is Const(())
+    assert not kwargs.pop('update_consts').val
+
+    # Override default name, 'scatter-add'
+    return Call(Var("scatter_add"), [*args, dimension_numbers] + kwargs_to_dict_call(kwargs))
+
+if xla_call_p:
+
+    @dictassign(translators, xla_call_p)
+    def _(*args, **kwargs):
+        call_jaxpr = kwargs.pop("call_jaxpr")
+        # TODO:
+        #   1. check all kwargs are benign before erasing
+        #   2. make this work if needed
+        #      xla_call_p wants the jaxpr pulled out of kwargs
+        #      return Call(Var("xla_call_p.bind"), [call_jaxpr, *args] + kwargs_to_dict_call(kwargs))
+        return Call(call_jaxpr, list(args))
+
+
+def jaxpr_to_expr(jaxpr) -> Lambda:
+    """
+    Convert Jaxpr to jaxutils.Expr
+    """
+
+    # Will return Lambda(args, body)
+    body = mkTuple([jaxpr_to_expr_aux(v) for v in jaxpr.outvars])
+
+    for cv in reversed(jaxpr.constvars):
+        body = Let([jaxpr_to_expr_aux(cv)], Const(cv.aval), body)
+
+    for eqn in reversed(jaxpr.eqns):
+        new_params = {key: jaxpr_to_expr_aux(val) for key, val in eqn.params.items()}
+        args = [jaxpr_to_expr_aux(v) for v in eqn.invars]
+
+        val = None
+        if eqn.primitive in translators:
+            val = translators[eqn.primitive](*args, **new_params)
+
+        if val is None:
+            params = kwargs_to_dict_call(new_params)
+            val = Call(Var(eqn.primitive.name + "_p.bind"), args + params)
+
+        vars = map(jaxpr_to_expr_aux, eqn.outvars)
+        body = Let([*vars], val, body)
+
+    args = [jaxpr_to_expr_aux(v) for v in jaxpr.invars]
+    return Lambda(args, body)
+
+def jaxpr_to_expr_aux(x) -> Expr:
     if x is None or isinstance(
         x,
         (
@@ -90,256 +211,8 @@ def toExpr(x) -> Expr:
     assert False, f"Check {type(x)} shouldn't be transformed [{repr(x)}]"
 
 
-def kwargs_to_dict_call(dict):
-    if not dict:
-        return []
 
-    dict_pairs = [[Const(key), val] for key, val in dict.items()]
-    return [Call(Var("**jaxutils_p2d"), list(itertools.chain(*dict_pairs)))]
-
-
-
-translators: Dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
-
-translate_pjit_passthru = True
-
-
-@dictassign(translators, pjit.pjit_p)
-def _(
-    *args,
-    jaxpr=None,
-    in_shardings=None,
-    out_shardings=None,
-    resource_env=None,
-    donated_invars=None,
-    name="",
-    keep_unused=False,
-    inline=False,
-):
-    # Elide the call if the shardings are unspecified
-    if (
-        translate_pjit_passthru
-        and unspecified(in_shardings.val)
-        and unspecified(out_shardings.val)
-    ):
-        return Call(jaxpr, list(args))
-
-
-@dictassign(translators, jax.lax.scatter_add_p)
-def _(*args, **kwargs):
-    # Override default name, 'scatter-add'
-    return Call(Var("scatter_add_p.bind"), list(args) + kwargs_to_dict_call(kwargs))
-
-@dictassign(translators, jax.interpreters.xla.xla_call_p)
-def _(*args, **kwargs):
-    call_jaxpr = kwargs.pop('call_jaxpr')
-    # TODO: 
-    #   1. check all kwargs are benign before erasing
-    #   2. make this work if needed
-    #      xla_call_p wants the jaxpr pulled out of kwargs
-    #      return Call(Var("xla_call_p.bind"), [call_jaxpr, *args] + kwargs_to_dict_call(kwargs)) 
-    return Call(call_jaxpr, list(args))
-
-
-def jaxpr_to_expr(jaxpr) -> Lambda:
-    """
-    Convert Jaxpr to jaxutils.Expr
-    """
-
-    # Will return Lambda(args, body)
-    body = mkTuple([toExpr(v) for v in jaxpr.outvars])
-
-    for cv in reversed(jaxpr.constvars):
-        body = Let([toExpr(cv)], Const(cv.aval), body)
-
-    for eqn in reversed(jaxpr.eqns):
-        new_params = {key: toExpr(val) for key, val in eqn.params.items()}
-        args = [toExpr(v) for v in eqn.invars]
-
-        val = None
-        if eqn.primitive in translators:
-            val = translators[eqn.primitive](*args, **new_params)
-
-        if val is None:
-            params = kwargs_to_dict_call(new_params)
-            val = Call(Var(eqn.primitive.name + "_p.bind"), args + params)
-
-        vars = map(toExpr, eqn.outvars)
-        body = Let([*vars], val, body)
-
-    args = [toExpr(v) for v in jaxpr.invars]
-    return Lambda(args, body)
-
-
-def mkTuple(es: List[Expr]) -> Expr:
-    if len(es) == 1:
-        return es[0]
-    else:
-        return Call(Var("tuple"), es)
-
-
-def all_equal(xs, ys):
-    if len(xs) != len(ys):
-        return False
-    for x, y in zip(xs, ys):
-        if x != y:
-            return False
-    return True
-
-
-def test_all_equal():
-    xs = [1, 2, 3]
-    ys = [1, 2]
-    assert not all_equal(xs, ys)
-    assert not all_equal([], ys)
-    assert not all_equal(xs, [])
-    assert all_equal(ys, ys)
-    assert all_equal(xs, xs)
-
-
-test_all_equal()
-
-
-def inline_call_of_lambda(e: Expr) -> Expr:
-    # call(lambda l_args: body, args)
-    #  ->  let l_args = args in body
-    # Name clashes will happen unless all bound var names were uniquified
-    if e.isCall and e.f.isLambda:
-        return Let(e.f.args, mkTuple(e.args), e.f.body)
-
-
-def inline_trivial_letbody(e: Expr) -> Expr:
-    # let var = val in var -> val
-    if e.isLet and len(e.vars) == 1:
-        if e.vars == [e.body]:
-            return e.val
-
-
-def inline_lambda_of_call(e: Expr) -> Expr:
-    # Lambda(args, Call(f, args)) -> f
-    if e.isLambda:
-        if e.body.isCall:
-            if all_equal(e.body.args, e.args):
-                return e.body.f
-
-
-def detuple_tuple_assignments(e: Expr) -> Expr:
-    # Let([a, b, c], Call(tuple, [aprime, bprime, cprime]),
-    #       body) ->
-    #  Let([a], aprime,
-    #    Let([b], bprime,
-    #      Let([c], cprime,
-    #           body)))
-    if e.isLet and len(e.vars) > 1:
-        if e.val.isCall and e.val.f == Var("tuple"):
-            new_body = e.body
-            for lhs, rhs in reversed(tuple(zip(e.vars, e.val.args))):
-                new_body = Let([lhs], rhs, new_body)
-            return new_body
-
-
-def to_anf(e):
-    e = uniquify_names(e)
-    assignments = []
-    expr = to_anf_aux(e, assignments)
-    # now rip through assignments, making Lets
-    for vars, val in reversed(assignments):
-        expr = Let(vars, val, expr)
-    return expr
-
-
-def to_anf_aux(e, assignments):
-    if e.isConst or e.isVar:
-        return e
-
-    if e.isLet:
-        new_val = to_anf_aux(e.val, assignments)
-        inner_assignments = []
-        abody = to_anf_aux(e.body, inner_assignments)
-        assign = (e.vars, new_val)
-        assignments += [assign]
-        assignments += inner_assignments
-        return abody
-
-    if e.isLambda:
-        return Lambda(e.args, to_anf(e.body))
-
-    if e.isCall:
-        new_f = to_anf_aux(e.f, assignments)
-        new_args = [to_anf_aux(arg, assignments) for arg in e.args]
-        return Call(new_f, new_args)
-
-    assert False
-
-
-def is_trivial(e: Expr):
-    if e.isVar:
-        return True
-
-    if e.isConst and isinstance(e.val, (float, str, int)):
-        return True
-
-    return False
-
-
-def inline_trivial_assignments(e):
-    return inline_trivial_assignments_aux(e, {})
-
-
-@beartype
-def inline_trivial_assignments_aux(e: Expr, translations: Dict[Var, Expr]):
-    # let a = b in body -> body[a->b]
-
-    recurse = inline_trivial_assignments_aux
-
-    if e.isConst:
-        return e
-
-    if e.isVar:
-        return translations.get(e, e)
-
-    if e.isLet:
-        new_val = recurse(e.val, translations)
-
-        # Remove our vars from translations
-        argset = set(e.vars)
-        new_translations = {
-            var: val for (var, val) in translations.items() if var not in argset
-        }
-        assert all(v not in new_translations for v in e.vars)
-
-        # let vars = val in body
-        if len(e.vars) == 1 and is_trivial(new_val):
-            new_translations[e.vars[0]] = new_val
-            return recurse(e.body, new_translations)
-        else:
-            new_body = recurse(e.body, new_translations)
-            return Let(e.vars, new_val, new_body)
-
-    if e.isLambda:
-        argset = set(e.args)
-        new_translations = {
-            var: val for (var, val) in translations.items() if var not in argset
-        }
-        assert all(v not in new_translations for v in e.args)
-        new_body = recurse(e.body, new_translations)
-        return Lambda(e.args, new_body)
-
-    if e.isCall:
-        new_f = recurse(e.f, translations)
-        new_args = [recurse(arg, translations) for arg in e.args]
-        return Call(new_f, new_args)
-
-    assert False
-
-
-def test_inline_trivial_assignments():
-    a, b, c, d = mkvars("a,b,c,d")
-    e = Let([a], b, Call(a, [Let([a], c, Call(a, [a, b, c]))]))
-    out = inline_trivial_assignments(e)
-    pprint(out)
-    expect = Call(b, [Call(c, [c, b, c])])
-    assert out == expect
+import inspect
 
 
 def jaxutils_p2d(*pairs):
@@ -350,10 +223,6 @@ def jaxutils_p2d(*pairs):
 def test_jaxutils_p2d():
     assert jaxutils_p2d("a", 2, "b", 3) == {"a": 2, "b": 3}
     assert jaxutils_p2d() == {}
-
-
-import inspect
-
 
 def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=None, **kwargs):
     """
@@ -377,33 +246,7 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=None, **kwargs):
     closed_jaxpr = jaxpr(*args)
     e = jaxpr_to_expr(closed_jaxpr.jaxpr)
 
-    def signature(e):
-        return set.union(freevars(e), {Var("tuple")})
-
-    global sig
-    sig = signature(e)
-
-    def check(ex):
-        global sig
-        new_sig = signature(ex)
-        assert sig == new_sig
-        # sig = new_sig - if we wanted to keep going
-
-    e = uniquify_names(e)
-    check(e)
-
-    e = transform(inline_call_of_lambda, e)
-    check(e)
-    e = transform(inline_trivial_letbody, e)
-    check(e)
-    e = transform(inline_lambda_of_call, e)
-    check(e)
-    e = to_anf(e)
-    check(e)
-    e = transform(detuple_tuple_assignments, e)
-    check(e)
-    e = inline_trivial_assignments(e)
-    check(e)
+    e = optimize(e)
 
     as_ast = to_ast(e, name)
     body_code = astunparse.unparse(as_ast)
@@ -492,8 +335,18 @@ def test_vmap():
 
     show_jaxpr(vmapgradf, vargs, name="vmapgradf")
 
+import importlib.util
 
-def test_roundtrip():
+def load_module(filename, module_name):
+  spec = importlib.util.spec_from_file_location(module_name, filename)
+  module = importlib.util.module_from_spec(spec)
+  sys.modules[module_name] = module
+  spec.loader.exec_module(module)
+  return module
+
+
+@pytest.mark.parametrize('n',[0, 1])
+def test_roundtrip(n):
     import os
 
     def foo(p, x):
@@ -504,60 +357,45 @@ def test_roundtrip():
     vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
 
     prng = jax.random.PRNGKey(42)
-    if 1:
-      f = foo
-      args = (2.2, jax.random.normal(prng, (2, 5)))
+    if n == 0:
+        f = foo
+        args = (2.2, jax.random.normal(prng, (2, 5)))
     else:
-      f = vmapgradf
-      args = (2.2, jax.random.normal(prng, (3, 2, 5)))
+        f = vmapgradf
+        args = (2.2, jax.random.normal(prng, (3, 2, 5)))
 
     print("f(args)=")
     print(f(*args))
 
+    def save(f, args, name, fn):
+      jaxutils.expr._global_name_id = 0
+
+      with open(fn, "w") as file:
+          show_jaxpr(f, args, name=name, file=file, add_decls=True)
+
+      os.system(f"black -q -l 120 {fn}")
+
     # Save to file
     fn = "tmp/show_jaxpr_jaxpr.py"
-    with open(fn, "w") as file:
-        show_jaxpr(f, args, name="f", file=file, add_decls=True)
-
-    os.system(f"black {fn}")
+    save(f, args, "f", fn)
 
     # Load from file
-    import importlib.util
+    module = load_module(fn, "show_jaxpr_roundtrip")
 
-    module_name = "show_jaxpr_roundtrip"
-    spec = importlib.util.spec_from_file_location(module_name, fn)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-
-    # Check rountrip: does module.f give the same result?
+    # Check roundtrip: does module.f give the same result?
     assert jnp.allclose(module.f(*args), f(*args))
 
     # Save again
     fn2 = "tmp/show_jaxpr_roundtrip.py"
-    with open(fn2, "w") as file2:
-        show_jaxpr(module.f, args, name="f", file=file2, add_decls=True)
+    save(module.f, args, "f", fn2)
 
-    os.system(f"black {fn2}")
+    # Does it render the same?  Probably not, as nested calls have been optimized, 
+    # changing the results of uniquify_names, even with uniquify_names
+    os.system(f"diff {fn} {fn2}")
 
-    # Reload for 2nd roundtrip to test string equality
-    module_name = "show_jaxpr_roundtrip2"
-    spec = importlib.util.spec_from_file_location(module_name, fn2)
-    module2 = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module2
-    spec.loader.exec_module(module2)
-
-    assert jnp.allclose(module.f(*args), f(*args))
-
-    # Sand save 2nd roundtrip
-    fn3 = "tmp/show_jaxpr_roundtrip2.py"
-    with open(fn3, "w") as file3:
-        show_jaxpr(module2.f, args, name="f", file=file3, add_decls=True)
-
-    os.system(f"black {fn3}")
-
-    print(f"code --diff {fn2} {fn3} # Do view diffs in vs code")
+    print(f"code --diff {fn} {fn2} # Do view diffs in vs code")
 
 
 if __name__ == "__main__":
-    test_roundtrip()
+    test_roundtrip(0)
+    test_roundtrip(1)
