@@ -12,6 +12,8 @@ if sys.version_info >= (3, 9):
 else:
     import astunparse
 
+
+### TODO: General utils - should move elsewhere
 def dictassign(d: Dict[Any, Callable], key: Any):
     """
     A decorator to add functions to dicts.
@@ -34,15 +36,15 @@ def dictassign(d: Dict[Any, Callable], key: Any):
        def _():
           ...
     ```
-    In this case (i.e. if the wrapped function's name is '_'), dictassign 
+    In this case (i.e. if the wrapped function's name is '_'), dictassign
     will replace the name of the wrapped function with `_@dictassign_{str(key)}`,
     which gives useful documentation in backtraces.
     """
 
     def wrapper(func):
         d[key] = func
-        if func.__name__ == '_':
-            newname = '_@dictassign_' + str(key)
+        if func.__name__ == "_":
+            newname = "_@dictassign_" + str(key)
             func.__name__ = newname
             func.__code__ = func.__code__.replace(co_name=newname)
 
@@ -50,15 +52,37 @@ def dictassign(d: Dict[Any, Callable], key: Any):
 
     return wrapper
 
+
+def all_equal(xs, ys):
+    if len(xs) != len(ys):
+        return False
+    for x, y in zip(xs, ys):
+        if x != y:
+            return False
+    return True
+
+
+def test_all_equal():
+    xs = [1, 2, 3]
+    ys = [1, 2]
+    assert not all_equal(xs, ys)
+    assert not all_equal([], ys)
+    assert not all_equal(xs, [])
+    assert all_equal(ys, ys)
+    assert all_equal(xs, xs)
+
+
+test_all_equal()
+
 ### New name factory
 
-name_id = 0
+_global_name_id = 0
 
 
 def get_new_name():
-    global name_id
-    name_id += 1
-    return f"{name_id:02d}"
+    global _global_name_id
+    _global_name_id += 1
+    return f"{_global_name_id:02d}"
 
 
 ## Declare Expr classes
@@ -247,6 +271,158 @@ def test_visit():
     visit(e, lambda x: print(type(x)))
 
 
+def mkTuple(es: List[Expr]) -> Expr:
+    if len(es) == 1:
+        return es[0]
+    else:
+        return Call(Var("tuple"), es)
+
+
+### Optimizations
+
+
+def inline_call_of_lambda(e: Expr) -> Expr:
+    # call(lambda l_args: body, args)
+    #  ->  let l_args = args in body
+    # Name clashes will happen unless all bound var names were uniquified
+    if e.isCall and e.f.isLambda:
+        return Let(e.f.args, mkTuple(e.args), e.f.body)
+
+
+def inline_trivial_letbody(e: Expr) -> Expr:
+    # let var = val in var -> val
+    if e.isLet and len(e.vars) == 1:
+        if e.vars == [e.body]:
+            return e.val
+
+
+def inline_lambda_of_call(e: Expr) -> Expr:
+    # Lambda(args, Call(f, args)) -> f
+    if e.isLambda:
+        if e.body.isCall:
+            if all_equal(e.body.args, e.args):
+                return e.body.f
+
+
+def detuple_tuple_assignments(e: Expr) -> Expr:
+    # Let([a, b, c], Call(tuple, [aprime, bprime, cprime]),
+    #       body) ->
+    #  Let([a], aprime,
+    #    Let([b], bprime,
+    #      Let([c], cprime,
+    #           body)))
+    if e.isLet and len(e.vars) > 1:
+        if e.val.isCall and e.val.f == Var("tuple"):
+            new_body = e.body
+            for lhs, rhs in reversed(tuple(zip(e.vars, e.val.args))):
+                new_body = Let([lhs], rhs, new_body)
+            return new_body
+
+
+def to_anf(e):
+    e = uniquify_names(e)
+    assignments = []
+    expr = to_anf_aux(e, assignments)
+    # now rip through assignments, making Lets
+    for vars, val in reversed(assignments):
+        expr = Let(vars, val, expr)
+    return expr
+
+
+def to_anf_aux(e, assignments):
+    if e.isConst or e.isVar:
+        return e
+
+    if e.isLet:
+        new_val = to_anf_aux(e.val, assignments)
+        inner_assignments = []
+        abody = to_anf_aux(e.body, inner_assignments)
+        assign = (e.vars, new_val)
+        assignments += [assign]
+        assignments += inner_assignments
+        return abody
+
+    if e.isLambda:
+        return Lambda(e.args, to_anf(e.body))
+
+    if e.isCall:
+        new_f = to_anf_aux(e.f, assignments)
+        new_args = [to_anf_aux(arg, assignments) for arg in e.args]
+        return Call(new_f, new_args)
+
+    assert False
+
+
+def is_trivial(e: Expr):
+    if e.isVar:
+        return True
+
+    if e.isConst and isinstance(e.val, (float, str, int)):
+        return True
+
+    return False
+
+
+def inline_trivial_assignments(e):
+    return inline_trivial_assignments_aux(e, {})
+
+
+@beartype
+def inline_trivial_assignments_aux(e: Expr, translations: Dict[Var, Expr]):
+    # let a = b in body -> body[a->b]
+
+    recurse = inline_trivial_assignments_aux
+
+    if e.isConst:
+        return e
+
+    if e.isVar:
+        return translations.get(e, e)
+
+    if e.isLet:
+        new_val = recurse(e.val, translations)
+
+        # Remove our vars from translations
+        argset = set(e.vars)
+        new_translations = {
+            var: val for (var, val) in translations.items() if var not in argset
+        }
+        assert all(v not in new_translations for v in e.vars)
+
+        # let vars = val in body
+        if len(e.vars) == 1 and is_trivial(new_val):
+            new_translations[e.vars[0]] = new_val
+            return recurse(e.body, new_translations)
+        else:
+            new_body = recurse(e.body, new_translations)
+            return Let(e.vars, new_val, new_body)
+
+    if e.isLambda:
+        argset = set(e.args)
+        new_translations = {
+            var: val for (var, val) in translations.items() if var not in argset
+        }
+        assert all(v not in new_translations for v in e.args)
+        new_body = recurse(e.body, new_translations)
+        return Lambda(e.args, new_body)
+
+    if e.isCall:
+        new_f = recurse(e.f, translations)
+        new_args = [recurse(arg, translations) for arg in e.args]
+        return Call(new_f, new_args)
+
+    assert False
+
+
+def test_inline_trivial_assignments():
+    a, b, c, d = mkvars("a,b,c,d")
+    e = Let([a], b, Call(a, [Let([a], c, Call(a, [a, b, c]))]))
+    out = inline_trivial_assignments(e)
+    pprint(out)
+    expect = Call(b, [Call(c, [c, b, c])])
+    assert out == expect
+
+
 def let_to_lambda(e: Expr) -> Expr:
     """
     let x = val in body
@@ -257,6 +433,37 @@ def let_to_lambda(e: Expr) -> Expr:
         val = transform(let_to_lambda, e.val)
         body = transform(let_to_lambda, e.body)
         return Call(Lambda(e.vars, body), [val])
+
+
+def optimize(e: Expr) -> Expr:
+    def signature(e):
+        return set.union(freevars(e), {Var("tuple")})
+
+    global sig
+    sig = signature(e)
+
+    def check(ex):
+        global sig
+        new_sig = signature(ex)
+        assert sig == new_sig
+        # sig = new_sig - if we wanted to keep going
+
+    e = uniquify_names(e)
+    check(e)
+
+    e = transform(inline_call_of_lambda, e)
+    check(e)
+    e = transform(inline_trivial_letbody, e)
+    check(e)
+    e = transform(inline_lambda_of_call, e)
+    check(e)
+    e = to_anf(e)
+    check(e)
+    e = transform(detuple_tuple_assignments, e)
+    check(e)
+    e = inline_trivial_assignments(e)
+    check(e)
+    return e
 
 
 def test_let_to_lambda():
@@ -421,7 +628,7 @@ def test_eval():
     assert v == 5
 
 
-######### AST
+######### To AST
 
 
 def to_ast_FunctionDef(name, args, body):
@@ -452,6 +659,7 @@ def to_ast_args(vars: List[Var]) -> ast.arguments:
     )
 
 
+@beartype
 def to_ast_constant(val):
     if isinstance(val, enum.Enum):
         # repr doesn't work for enum...
@@ -459,7 +667,10 @@ def to_ast_constant(val):
     else:
         rep = repr(val)
 
-    return ast.parse(rep).body[0]
+    module = ast.parse(rep)
+    ast_expr: ast.Expr = module.body[0]
+    assert isinstance(ast_expr, ast.Expr)
+    return ast_expr.value
 
 
 def to_ast_aux(e, assignments):
@@ -513,6 +724,9 @@ def test_ast():
 
     # code = compile(a, 'bar', 'exec')
     # exec(code)
+
+
+#### From AST
 
 
 def from_ast(a: ast.AST):
@@ -603,23 +817,6 @@ def from_ast(a: ast.AST):
     assert False, f"TODO:{type(a)}"
 
 
-def expr_for(f: Callable) -> Expr:
-    import inspect
-    import textwrap
-
-    a = ast.parse(textwrap.dedent(inspect.getsource(f)))
-    return from_ast(a)
-
-
-def expr_to_python_code(e: Expr, name: str) -> str:
-    as_ast = to_ast(e, name)
-    return astunparse.unparse(as_ast)
-
-
-def eval_expr(e: Expr, args, bindings):
-    return run_eval(Call(e, [Const(a) for a in args]), bindings)
-
-
 def test_ast_to_expr():
     import jax.numpy as jnp
 
@@ -679,3 +876,23 @@ def test_ast_to_expr2():
             "getattr": getattr,
         },
     )
+
+
+#### Misc
+
+
+def expr_for(f: Callable) -> Expr:
+    import inspect
+    import textwrap
+
+    a = ast.parse(textwrap.dedent(inspect.getsource(f)))
+    return from_ast(a)
+
+
+def expr_to_python_code(e: Expr, name: str) -> str:
+    as_ast = to_ast(e, name)
+    return astunparse.unparse(as_ast)
+
+
+def eval_expr(e: Expr, args, bindings):
+    return run_eval(Call(e, [Const(a) for a in args]), bindings)
