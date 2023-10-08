@@ -598,7 +598,7 @@ def test_ast_to_expr():
     expected = foo(5)
 
     e = expr_for(foo)
-    print(expr_to_python_code(e))
+    print(expr_to_python_code(e, 'foo'))
 
     import operator
 
@@ -630,7 +630,7 @@ def test_ast_to_expr2():
     print(expected)
 
     e_foo = expr_for(foo)
-    print(expr_to_python_code(e_foo))
+    print(expr_to_python_code(e_foo, 'foo'))
     import operator
 
     got = eval_expr(
