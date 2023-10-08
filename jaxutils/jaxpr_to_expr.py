@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from jaxutils.expr import Expr, Var, Const, Lambda, Let, Call
 
 from jaxutils.expr import (
+    dictassign,
     freevars,
     uniquify_names,
     mkvars,
@@ -97,37 +98,6 @@ def kwargs_to_dict_call(dict):
     return [Call(Var("**jaxutils_p2d"), list(itertools.chain(*dict_pairs)))]
 
 
-def dictassign(d: Dict[Any, Callable], key: Any):
-    """
-    A decorator to add functions to dicts.
-       ```
-       @dictassign(fundict, 'times')
-       def my_times_impl():
-          ...
-       ```
-    is the same as
-       ```
-       def my_times_impl():
-          ...
-       fundict['times'] = my_times_impl
-       ```
-    The advantages are readability: we can see at the time of `def` that
-    this function will go in `fundict`.  In fact, the name of the function
-    is irrelevant: recommended usage is
-    ```
-       @dictassign(fundict, 'times')
-       def _():
-          ...
-    ```
-    So the only name the function has is `fundict['times']`
-    """
-
-    def wrapper(func):
-        d[key] = func
-        return None
-
-    return wrapper
-
 
 translators: Dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
 
@@ -159,6 +129,16 @@ def _(
 def _(*args, **kwargs):
     # Override default name, 'scatter-add'
     return Call(Var("scatter_add_p.bind"), list(args) + kwargs_to_dict_call(kwargs))
+
+@dictassign(translators, jax.interpreters.xla.xla_call_p)
+def _(*args, **kwargs):
+    call_jaxpr = kwargs.pop('call_jaxpr')
+    # TODO: 
+    #   1. check all kwargs are benign before erasing
+    #   2. make this work if needed
+    #      xla_call_p wants the jaxpr pulled out of kwargs
+    #      return Call(Var("xla_call_p.bind"), [call_jaxpr, *args] + kwargs_to_dict_call(kwargs)) 
+    return Call(call_jaxpr, list(args))
 
 
 def jaxpr_to_expr(jaxpr) -> Lambda:
@@ -449,7 +429,8 @@ else:
     import jax._src.core as jaxcore
     from jax._src import pjit
     import jaxlib.xla_extension as xla_ext
-    array = jnp.array
+
+array = jnp.array
 
 from jax._src.ad_util import add_any_p
 
@@ -459,6 +440,14 @@ from jax._src.ad_util import add_any_p
         )
 
     print(body_code, file=file)
+
+    print(
+        f"""
+if __name__ == '__main__':
+    {name}{args}
+""",
+        file=file,
+    )
 
 
 def test_basic():
