@@ -12,6 +12,45 @@ if sys.version_info >= (3, 9):
 else:
     import astunparse
 
+def dictassign(d: Dict[Any, Callable], key: Any):
+    """
+    A decorator to add functions to dicts.
+       ```
+       @dictassign(fundict, 'times')
+       def my_times_impl():
+          ...
+       ```
+    is the same as
+       ```
+       def my_times_impl():
+          ...
+       fundict['times'] = my_times_impl
+       ```
+    The advantages are readability: we can see at the time of `def` that
+    this function will go in `fundict`.  In fact, the name of the function
+    is irrelevant: recommended usage is
+    ```
+       @dictassign(fundict, 'times')
+       def _():
+          ...
+    ```
+    In this case (i.e. if the wrapped function's name is '_'), dictassign 
+    will replace the name of the wrapped function with `_@dictassign_{str(key)}`,
+    which gives useful documentation in backtraces.
+    """
+
+    def wrapper(func):
+        d[key] = func
+        if func.__name__ == '_':
+            newname = '_@dictassign_' + str(key)
+            func.__name__ = newname
+            func.__code__ = func.__code__.replace(co_name=newname)
+
+        return None
+
+    return wrapper
+
+### New name factory
 
 name_id = 0
 
