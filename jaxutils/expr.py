@@ -5,7 +5,13 @@ from beartype import beartype
 from beartype.typing import List, Set, Any, Tuple, Dict, List, Callable
 from pprint import pprint
 
-import numpy # TODO just needed once
+import ast
+
+if sys.version_info >= (3, 9):
+    astunparse = ast
+else:
+    import astunparse
+
 
 name_id = 0
 
@@ -364,7 +370,7 @@ def test_eval():
     f_defs = {
         "add": operator.add,
         "tuple": lambda *args: tuple(args),
-        "getattr": getattr
+        "getattr": getattr,
     }
 
     v = run_eval(Call(f_add, [Const(2), Const(3)]), f_defs)
@@ -377,13 +383,6 @@ def test_eval():
 
 
 ######### AST
-
-import ast
-
-if sys.version_info >= (3, 9):
-    astunparse = ast
-else:
-    import astunparse
 
 
 def to_ast_FunctionDef(name, args, body):
@@ -413,24 +412,21 @@ def to_ast_args(vars: List[Var]) -> ast.arguments:
         kw_defaults=None,
     )
 
+
 def to_ast_constant(val):
-        if isinstance(val, tuple):
-            vals = [to_ast_constant(v) for v in val]
-            return ast.Tuple(vals, ast.Load())
+    if isinstance(val, enum.Enum):
+        # repr doesn't work for enum...
+        rep = str(val)
+    else:
+        rep = repr(val)
 
-        if isinstance(val, enum.Enum):
-            # TODO Ew, should probably make an Attribute
-            return ast.Name(type(val).__name__ + '.' + val.name)
+    return ast.parse(rep).body[0]
 
-        # TODO a bit ugly
-        scalar_types = (str, bytes, bool, int, float, complex, numpy.dtype, numpy.number)
-        #assert val is None or isinstance(val, scalar_types)
-        return ast.Constant(value=val, kind=None)
 
 def to_ast_aux(e, assignments):
     if e.isConst:
         return to_ast_constant(e.val)
-    
+
     if e.isVar:
         return ast.Name(e.name, ast.Load())
 
@@ -556,14 +552,13 @@ def from_ast(a: ast.AST):
 
     if isinstance(a, ast.Subscript):
         return Call(Var("ast.Subscript"), [recurse(a.value), recurse(a.slice)])
-    
+
     if isinstance(a, ast.Index):
         return recurse(a.value)
-        
+
     if isinstance(a, (ast.ExtSlice, ast.Slice)):
         # Plan is to overload "ast.Subscript" implementation to handle them all.
         assert False
-
 
     # Fallthru
     assert False, f"TODO:{type(a)}"
@@ -598,7 +593,7 @@ def test_ast_to_expr():
     expected = foo(5)
 
     e = expr_for(foo)
-    print(expr_to_python_code(e, 'foo'))
+    print(expr_to_python_code(e, "foo"))
 
     import operator
 
@@ -630,18 +625,18 @@ def test_ast_to_expr2():
     print(expected)
 
     e_foo = expr_for(foo)
-    print(expr_to_python_code(e_foo, 'foo'))
+    print(expr_to_python_code(e_foo, "foo"))
     import operator
 
     got = eval_expr(
         e_foo,
         args,
         {
-            "ast.Subscript": lambda a,slice: a[slice],
+            "ast.Subscript": lambda a, slice: a[slice],
             "ast.MatMult": operator.matmul,
             "ast.Mult": operator.mul,
             "ast.Add": operator.add,
             "tuple": lambda *args: tuple(args),
-            'getattr': getattr
+            "getattr": getattr,
         },
     )

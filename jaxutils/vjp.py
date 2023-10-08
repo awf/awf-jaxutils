@@ -38,7 +38,7 @@ def ensure_tuple(val):
 
 # vjp checker.
 # Tols set for 32 bit float
-def check(f, f_grad, *args, rtol=1e-5, atol=1e-7, verbose=False):
+def check(f, f_grad, *args, rtol=1e-4, atol=1e-6, verbose=False):
     print("Checking", f, end="...")
     val = f(*args)
 

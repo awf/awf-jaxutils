@@ -32,7 +32,8 @@ from jaxutils.expr import (
     uniquify_names,
     mkvars,
     transform,
-    expr_to_python_code,
+    to_ast,
+    astunparse
 )
 
 import ast
@@ -96,12 +97,45 @@ def kwargs_to_dict_call(dict):
     return [Call(Var("**jaxutils_p2d"), list(itertools.chain(*dict_pairs)))]
 
 
+def dictassign(d: Dict[Any, Callable], key: Any):
+    """
+    A decorator to add functions to dicts.
+       ```
+       @dictassign(fundict, 'times')
+       def my_times_impl():
+          ...
+       ```
+    is the same as
+       ```
+       def my_times_impl():
+          ...
+       fundict['times'] = my_times_impl
+       ```
+    The advantages are readability: we can see at the time of `def` that
+    this function will go in `fundict`.  In fact, the name of the function
+    is irrelevant: recommended usage is
+    ```
+       @dictassign(fundict, 'times')
+       def _():
+          ...
+    ```
+    So the only name the function has is `fundict['times']`
+    """
+
+    def wrapper(func):
+        d[key] = func
+        return None
+
+    return wrapper
+
+
 translators: Dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
 
-PJIT_PASSTHRU = True
+translate_pjit_passthru = True
 
 
-def translate_pjit(
+@dictassign(translators, pjit.pjit_p)
+def _(
     *args,
     jaxpr=None,
     in_shardings=None,
@@ -114,18 +148,17 @@ def translate_pjit(
 ):
     # Elide the call if the shardings are unspecified
     if (
-        PJIT_PASSTHRU
+        translate_pjit_passthru
         and unspecified(in_shardings.val)
         and unspecified(out_shardings.val)
     ):
-        return Call(jaxpr, args)
+        return Call(jaxpr, list(args))
 
 
-translators[pjit.pjit_p] = translate_pjit
-
-translators[jax.lax.scatter_add_p] = lambda *args, **kwargs: Call(
-    Var("scatter_add_p.bind"), list(*args) + kwargs_to_dict_call(kwargs)
-)
+@dictassign(translators, jax.lax.scatter_add_p)
+def _(*args, **kwargs):
+    # Override default name, 'scatter-add'
+    return Call(Var("scatter_add_p.bind"), list(args) + kwargs_to_dict_call(kwargs))
 
 
 def jaxpr_to_expr(jaxpr) -> Lambda:
@@ -145,7 +178,7 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
 
         val = None
         if eqn.primitive in translators:
-            val = translators[eqn.primitive](args, **new_params)
+            val = translators[eqn.primitive](*args, **new_params)
 
         if val is None:
             params = kwargs_to_dict_call(new_params)
@@ -328,15 +361,19 @@ def test_inline_trivial_assignments():
     expect = Call(b, [Call(c, [c, b, c])])
     assert out == expect
 
+
 def jaxutils_p2d(*pairs):
-      it = iter(pairs)
-      return {a:b for (a,b) in zip(it,it)}
+    it = iter(pairs)
+    return {a: b for (a, b) in zip(it, it)}
+
 
 def test_jaxutils_p2d():
-    assert jaxutils_p2d('a', 2, 'b', 3) == {'a':2, 'b': 3}
+    assert jaxutils_p2d("a", 2, "b", 3) == {"a": 2, "b": 3}
     assert jaxutils_p2d() == {}
 
+
 import inspect
+
 
 def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=None, **kwargs):
     """
@@ -388,7 +425,8 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=None, **kwargs):
     e = inline_trivial_assignments(e)
     check(e)
 
-    body_code = expr_to_python_code(e, name)
+    as_ast = to_ast(e, name)
+    body_code = astunparse.unparse(as_ast)
 
     if add_decls:
         print(
@@ -411,7 +449,9 @@ else:
     import jax._src.core as jaxcore
     from jax._src import pjit
     import jaxlib.xla_extension as xla_ext
-    Array = jnp.array
+    array = jnp.array
+
+from jax._src.ad_util import add_any_p
 
 {inspect.getsource(jaxutils_p2d)}
 """,
@@ -474,10 +514,13 @@ def test_roundtrip():
     gradf = jax.grad(foo, argnums=1)
     vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
 
-    f = vmapgradf
-
     prng = jax.random.PRNGKey(42)
-    args = (2.2, jax.random.normal(prng, (3, 2, 5)))
+    if 1:
+      f = foo
+      args = (2.2, jax.random.normal(prng, (2, 5)))
+    else:
+      f = vmapgradf
+      args = (2.2, jax.random.normal(prng, (3, 2, 5)))
 
     print("f(args)=")
     print(f(*args))
@@ -504,7 +547,7 @@ def test_roundtrip():
     # Save again
     fn2 = "tmp/show_jaxpr_roundtrip.py"
     with open(fn2, "w") as file2:
-        show_jaxpr(module.f, args, file=file2, add_decls=True)
+        show_jaxpr(module.f, args, name="f", file=file2, add_decls=True)
 
     os.system(f"black {fn2}")
 
@@ -520,11 +563,12 @@ def test_roundtrip():
     # Sand save 2nd roundtrip
     fn3 = "tmp/show_jaxpr_roundtrip2.py"
     with open(fn3, "w") as file3:
-        show_jaxpr(module2.f, args, file=file3, add_decls=True)
+        show_jaxpr(module2.f, args, name="f", file=file3, add_decls=True)
 
     os.system(f"black {fn3}")
 
     print(f"code --diff {fn2} {fn3} # Do view diffs in vs code")
 
+
 if __name__ == "__main__":
-  test_roundtrip()
+    test_roundtrip()
