@@ -93,7 +93,7 @@ def kwargs_to_dict_call(dict):
         return []
 
     dict_pairs = [[Const(key), val] for key, val in dict.items()]
-    return [Call(Var("jaxutils.p2d"), list(itertools.chain(*dict_pairs)))]
+    return [Call(Var("**jaxutils_p2d"), list(itertools.chain(*dict_pairs)))]
 
 
 translators: Dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
@@ -328,8 +328,17 @@ def test_inline_trivial_assignments():
     expect = Call(b, [Call(c, [c, b, c])])
     assert out == expect
 
+def jaxutils_p2d(*pairs):
+      it = iter(pairs)
+      return {a:b for (a,b) in zip(it,it)}
 
-def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
+def test_jaxutils_p2d():
+    assert jaxutils_p2d('a', 2, 'b', 3) == {'a':2, 'b': 3}
+    assert jaxutils_p2d() == {}
+
+import inspect
+
+def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=None, **kwargs):
     """
     Show jaxpr f as if in python, i.e. "decompile" to python
 
@@ -342,6 +351,10 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
         name = f.__name__
 
     doc = f.__doc__
+
+    # Add decls if saving to file, but not to screen
+    if add_decls == None:
+        add_decls = file != sys.stdout
 
     jaxpr = jax.make_jaxpr(f, **kwargs)
     closed_jaxpr = jaxpr(*args)
@@ -374,6 +387,7 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
     check(e)
     e = inline_trivial_assignments(e)
     check(e)
+
     body_code = expr_to_python_code(e, name)
 
     if add_decls:
@@ -398,9 +412,8 @@ else:
     from jax._src import pjit
     import jaxlib.xla_extension as xla_ext
     Array = jnp.array
-    
-add_any_p = add_p
 
+{inspect.getsource(jaxutils_p2d)}
 """,
             file=file,
         )
@@ -513,4 +526,5 @@ def test_roundtrip():
 
     print(f"code --diff {fn2} {fn3} # Do view diffs in vs code")
 
-test_roundtrip()
+if __name__ == "__main__":
+  test_roundtrip()
