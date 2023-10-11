@@ -59,8 +59,6 @@ def unspecified(x):
     return tree_all(jax.tree_map(jax._src.sharding_impls.is_unspecified, x))
 
 
-
-
 def kwargs_to_dict_call(dict):
     if not dict:
         return []
@@ -69,7 +67,60 @@ def kwargs_to_dict_call(dict):
     return [Call(Var("**jaxutils_p2d"), list(itertools.chain(*dict_pairs)))]
 
 
+def new_call(fn: str, *args, **kwargs):
+    """
+    Convenience function to make a Call node from a string, args, and kwargs
+    """
+    return Call(Var(fn), list(args) + kwargs_to_dict_call(kwargs))
+
+
 translators: Dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
+
+
+@dictassign(translators, lax.convert_element_type_p)
+def _(val, new_dtype=None, weak_type=False):
+    if weak_type.val == False:
+        return new_call("convert_element_type", val, new_dtype)
+
+
+@dictassign(translators, lax.broadcast_in_dim_p)
+def _(val, shape=None, broadcast_dimensions=None):
+    return new_call("broadcast_in_dim", val, shape, broadcast_dimensions)
+
+
+@dictassign(translators, lax.squeeze_p)
+def _(val, dimensions=None):
+    return new_call("squeeze", val, dimensions)
+
+
+@dictassign(translators, lax.slice_p)
+def _(val, start_indices=None, limit_indices=None, strides=None):
+    if all(v == 1 for v in strides.val):
+        return new_call("slice", val, start_indices, limit_indices)
+    else:
+        return new_call("slice", val, start_indices, limit_indices, strides=strides)
+
+
+@dictassign(translators, lax.dot_general_p)
+def _(a, b, dimension_numbers=None, precision=None, preferred_element_type=None):
+    if precision.val is None and preferred_element_type.val is None:
+        # TODO Reverse-engineer to matmul where that's true, and if kwargs are default
+        # mm_pattern = (((1,), (0,)), ((), ()))
+        # if dimension_numbers == mm_pattern:
+        #     ...
+
+        return new_call("dot_general", a, b, dimension_numbers)
+
+    # Or just call the general
+    return new_call(
+        "dot_general",
+        a,
+        b,
+        dimension_numbers,
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+    )
+
 
 translate_pjit_passthru = True
 
@@ -119,20 +170,22 @@ def _(*args, **kwargs):
     # Check that update_jaxpr is just an add, else how do we convert?
     # The call to optimize is because update_jaxpr is sometimes of the form
     #    lambda a,b: let tmp = add(a,b) in tmp
-    # which simplifies to 
+    # which simplifies to
     #    add
     # Note that if this assert fails because update_jaxpr is some large complicated thing
     # be aware of possible quadratic complexity in calling optimize
-    update_jaxpr = kwargs.pop('update_jaxpr')
-    assert optimize(update_jaxpr) == Var('add_p.bind')
-
-    dimension_numbers = kwargs.pop('dimension_numbers')
+    update_jaxpr = kwargs.pop("update_jaxpr")
+    assert optimize(update_jaxpr) == Var("add_p.bind")
 
     # Hope update_consts is Const(())
-    assert not kwargs.pop('update_consts').val
+    assert not kwargs.pop("update_consts").val
+
+    # Move dimension_numbers from kwargs to args
+    dimension_numbers = kwargs.pop("dimension_numbers")
 
     # Override default name, 'scatter-add'
-    return Call(Var("scatter_add"), [*args, dimension_numbers] + kwargs_to_dict_call(kwargs))
+    return new_call("scatter_add", *args, dimension_numbers, **kwargs)
+
 
 if xla_call_p:
 
@@ -176,6 +229,7 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
     args = [jaxpr_to_expr_aux(v) for v in jaxpr.invars]
     return Lambda(args, body)
 
+
 def jaxpr_to_expr_aux(x) -> Expr:
     if x is None or isinstance(
         x,
@@ -204,12 +258,12 @@ def jaxpr_to_expr_aux(x) -> Expr:
         return jaxpr_to_expr(x.jaxpr)
 
     if isinstance(x, jaxcore.Var):
-        return Var(f"v_{x.count+11}{x.suffix}")
+        # return Var(f"v_{x.count+11}{x.suffix}")
+        return Var(f"v_{x}")
 
     # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
     # Explicitly add verified cases to
     assert False, f"Check {type(x)} shouldn't be transformed [{repr(x)}]"
-
 
 
 import inspect
@@ -224,11 +278,14 @@ def test_jaxutils_p2d():
     assert jaxutils_p2d("a", 2, "b", 3) == {"a": 2, "b": 3}
     assert jaxutils_p2d() == {}
 
-def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=None, **kwargs):
+
+def show_jaxpr(
+    f, args, name=None, file=sys.stdout, add_decls=None, optimize=True, static_argnums=(), **kwargs
+):
     """
     Show jaxpr f as if in python, i.e. "decompile" to python
 
-    Several optimization passes are run, to simplify the resulting code.
+    If `optimize`` is True, everal optimization passes are run, to simplify the resulting code.
     If global arg PJIT_PASSTHRU is True, then pjit(f)(args) with unspecified sharding
     is just rewritten to f(args), which can result in significantly simpler code.
     """
@@ -239,21 +296,28 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=None, **kwargs):
     doc = f.__doc__
 
     # Add decls if saving to file, but not to screen
+    our_file = None
+    if isinstance(file, str):
+        our_file = open(file, 'w')
+        print(f'show_jaxpr: Saving to [{file}]')
+        file = our_file
+
     if add_decls == None:
         add_decls = file != sys.stdout
 
-    jaxpr = jax.make_jaxpr(f, **kwargs)
+    jaxpr = jax.make_jaxpr(f, static_argnums=static_argnums, **kwargs)
     closed_jaxpr = jaxpr(*args)
     e = jaxpr_to_expr(closed_jaxpr.jaxpr)
 
-    e = optimize(e)
+    if optimize:
+        e = jaxutils.expr.optimize(e)
 
     as_ast = to_ast(e, name)
     body_code = astunparse.unparse(as_ast)
 
     if add_decls:
         print(
-            f"""
+            f"""#
 # show_jaxpr {f}
 from numpy import float32,int32
 from jax.lax import *
@@ -272,7 +336,9 @@ else:
     import jax._src.core as jaxcore
     from jax._src import pjit
     import jaxlib.xla_extension as xla_ext
+    Array = jnp.array
 
+nan = jnp.nan
 array = jnp.array
 
 from jax._src.ad_util import add_any_p
@@ -284,13 +350,84 @@ from jax._src.ad_util import add_any_p
 
     print(body_code, file=file)
 
-    print(
-        f"""
+    import numpy
+
+    numpy.set_printoptions(threshold=1e6)  # more than that, let's think about pickling
+    if add_decls:
+      non_static_args = [*args]
+      if static_argnums:
+        del non_static_args[static_argnums]
+      flat_args = jax.tree_util.tree_leaves(non_static_args)
+      test_args = ",".join(repr(arg) for arg in flat_args)
+
+      print(
+          f"""
 if __name__ == '__main__':
-    {name}{args}
+    {name}({test_args})
 """,
-        file=file,
-    )
+          file=file,
+      )
+
+    if add_decls:
+        # Dump jaxpr too
+        print("""
+###############################################################################
+#                                                                             #
+#                       #   ##   #    # #####  #####                          #
+#                       #  #  #   #  #  #    # #    #                         #
+#                       # #    #   ##   #    # #    #                         #
+#                       # ######   ##   #####  #####                          #
+#                   #   # #    #  #  #  #      #   #                          #
+#                   ####  #    # #    # #      #    #                         #
+#                                                                             #
+###############################################################################
+""", file=file)
+
+        print('jaxpr  = """', closed_jaxpr, '"""', file=file)
+
+    if add_decls:
+        # Dump XLA too
+        print("""
+###############################################################################
+#                                                                             #
+#                          #    # #       ####                                #
+#                          #    # #      #    #                               #
+#                          ###### #      #    #                               #
+#                          #    # #      #    #                               #
+#                          #    # #      #    #                               #
+#                          #    # ######  ####                                #
+#                                                                             #
+###############################################################################
+""", file=file)
+
+        import jaxlib.xla_extension as xla_ext
+
+        xc = jax.xla_computation(f, static_argnums=static_argnums)(*args)
+
+        backend = jax.lib.xla_bridge.get_backend()
+        e = backend.compile(xc)
+        module = e.hlo_modules()[0]
+
+        # You could use the presets
+        option = xla_ext.HloPrintOptions.short_parsable()
+        print('hlo_module  = """', module.to_string(option), '"""', file=file)
+
+        # option = xla_ext.HloPrintOptions.canonical()
+        # print(module.to_string(option))
+
+        # option = xla_ext.HloPrintOptions.fingerprint()
+        # print(module.to_string(option))
+
+        # # Or set each option manually
+        # option = xla_ext.HloPrintOptions()
+        # option.print_metadata = False
+        # option.include_layout_in_shapes = False
+        # print(module.to_string(option))
+
+
+
+    if our_file:
+        our_file.close()
 
 
 def test_basic():
@@ -335,17 +472,19 @@ def test_vmap():
 
     show_jaxpr(vmapgradf, vargs, name="vmapgradf")
 
+
 import importlib.util
 
+
 def load_module(filename, module_name):
-  spec = importlib.util.spec_from_file_location(module_name, filename)
-  module = importlib.util.module_from_spec(spec)
-  sys.modules[module_name] = module
-  spec.loader.exec_module(module)
-  return module
+    spec = importlib.util.spec_from_file_location(module_name, filename)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-@pytest.mark.parametrize('n',[0, 1])
+@pytest.mark.parametrize("n", [0, 1])
 def test_roundtrip(n):
     import os
 
@@ -368,12 +507,12 @@ def test_roundtrip(n):
     print(f(*args))
 
     def save(f, args, name, fn):
-      jaxutils.expr._global_name_id = 0
+        jaxutils.expr._global_name_id = 0
 
-      with open(fn, "w") as file:
-          show_jaxpr(f, args, name=name, file=file, add_decls=True)
+        with open(fn, "w") as file:
+            show_jaxpr(f, args, name=name, file=file, add_decls=True)
 
-      os.system(f"black -q -l 120 {fn}")
+        os.system(f"black -q -l 120 {fn}")
 
     # Save to file
     fn = "tmp/show_jaxpr_jaxpr.py"
@@ -389,7 +528,7 @@ def test_roundtrip(n):
     fn2 = "tmp/show_jaxpr_roundtrip.py"
     save(module.f, args, "f", fn2)
 
-    # Does it render the same?  Probably not, as nested calls have been optimized, 
+    # Does it render the same?  Probably not, as nested calls have been optimized,
     # changing the results of uniquify_names, even with uniquify_names
     os.system(f"diff {fn} {fn2}")
 
