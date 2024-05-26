@@ -6,3 +6,5 @@ icecream
 labml
 pytest
 black
+astunparse
+beartype
