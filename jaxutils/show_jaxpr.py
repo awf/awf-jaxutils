@@ -2,6 +2,7 @@ import types
 import sys
 import re
 import numpy as np
+from functools import lru_cache
 
 import jax
 import jaxlib.xla_extension as xla_ext
@@ -59,7 +60,7 @@ def doc_from_source_line(source_info):
     return fnames[0]
 
 
-foo_num = 1000
+foo_num = 100
 
 
 def pythonize(name):
@@ -75,6 +76,11 @@ def new_name(base):
     n = f"{base}{foo_num}"
     foo_num += 1
     return n
+
+
+@lru_cache
+def getname(x):
+    return new_name("v")
 
 
 def varstr(x):
@@ -106,9 +112,8 @@ def varstr(x):
         return "int32"
 
     # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
-    assert isinstance(
-        x, (str, bool, int, jax.lax.GatherDimensionNumbers)
-    ), f"Check this shouldn't be transformed [{repr(x)}]"
+    if not isinstance(x, (str, bool, int, dict, jax.lax.GatherDimensionNumbers)):
+        assert False, f"Check this shouldn't be transformed [{repr(x)}]"
 
     return repr(x)
 
