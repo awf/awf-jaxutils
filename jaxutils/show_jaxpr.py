@@ -98,7 +98,7 @@ def varstr(x):
         return str(x)
 
     if isinstance(x, jaxcore.Var):
-        return f"v{x.count}{x.suffix}_"
+        return getname(x)
 
     if isinstance(x, (jax.lax.GatherDimensionNumbers,)):
         return "GatherDimensionNumbers" + repr(x)
@@ -376,7 +376,7 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
 
 
 def show_jaxpr(
-    f, args, name=None, file=sys.stdout, add_decls=False, add_consts=True, **kwargs
+    f, args, name=None, file=sys.stdout, add_decls=False, add_main=False, **kwargs
 ):
     """
     Show jaxpr f as if in python, i.e. "decompile" to python
@@ -434,7 +434,7 @@ add_any_p = add_p
 
     print_jaxpr_as_python(name, closed_jaxpr.jaxpr, doc=doc, file=file)
 
-    if add_consts:
+    if add_main:
         print(
             f"""
 if __name__ == '__main__':
