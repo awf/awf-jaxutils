@@ -283,11 +283,14 @@ def test_relu():
 
 
 def softmax(x):
-    return jnn.softmax(x)
+    """
+    Column softmax
+    """
+    return jnn.softmax(x, axis=0)
 
 
 def softmax_vjp(x, dret):
-    ret = jnn.softmax(x)
+    ret = jnn.softmax(x, axis=0)
     return ret * dret - ret * jnp.dot(dret, ret)
 
 
@@ -312,7 +315,7 @@ def test_index():
     )
 
 
-# index
+# log
 log = jnp.log
 
 
@@ -322,3 +325,28 @@ def log_vjp(x, dret):
 
 def test_log():
     check(log, log_vjp, np.random.rand(13, 7))
+
+
+# log
+exp = jnp.exp
+
+
+def exp_vjp(x, dret):
+    return dret * exp(x)
+
+
+def test_exp():
+    check(exp, exp_vjp, np.random.rand(13, 7))
+
+
+# negate
+def negate(x):
+    return -x
+
+
+def negate_vjp(x, dret):
+    return -dret
+
+
+def test_negate():
+    check(negate, negate_vjp, np.random.rand(13, 7))
