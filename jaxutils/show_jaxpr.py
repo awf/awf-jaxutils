@@ -2,6 +2,7 @@ import types
 import sys
 import re
 import numpy as np
+from functools import lru_cache
 
 import jax
 import jaxlib.xla_extension as xla_ext
@@ -44,7 +45,7 @@ def doc_from_source_line(source_info):
     return fnames[0]
 
 
-foo_num = 1000
+foo_num = 100
 
 
 def pythonize(name):
@@ -62,6 +63,11 @@ def new_name(base):
     return n
 
 
+@lru_cache
+def getname(x):
+    return new_name("v")
+
+
 def varstr(x):
     if isinstance(
         x,
@@ -77,7 +83,7 @@ def varstr(x):
         return str(x)
 
     if isinstance(x, jax.core.Var):
-        return str(x) + "_"
+        return getname(x)
 
     if isinstance(x, (jax.lax.GatherDimensionNumbers,)):
         return "GatherDimensionNumbers" + repr(x)
@@ -91,9 +97,8 @@ def varstr(x):
         return "int32"
 
     # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
-    assert isinstance(
-        x, (str, bool, int, jax.lax.GatherDimensionNumbers)
-    ), f"Check this shouldn't be transformed [{repr(x)}]"
+    if not isinstance(x, (str, bool, int, dict, jax.lax.GatherDimensionNumbers)):
+        assert False, f"Check this shouldn't be transformed [{repr(x)}]"
 
     return repr(x)
 
@@ -190,7 +195,9 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
     print(f"{indent}return ({intercommavars(*jaxpr.outvars)})", file=file)
 
 
-def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
+def show_jaxpr(
+    f, args, name=None, file=sys.stdout, add_decls=False, add_main=False, **kwargs
+):
     """
     Show jaxpr f as if in python, i.e. "decompile" to python
     """
@@ -219,14 +226,15 @@ add_any_p = add_p
     closed_jaxpr = jaxpr(*args)
     examine_jaxpr(name, closed_jaxpr.jaxpr, doc=doc, file=file)
 
-    print(
-        f"""
-if __name__ == '__main__':
-    Array = jnp.array
-    {name}{args}
-""",
-        file=file,
-    )
+    if add_main:
+        print(
+            f"""
+  if __name__ == '__main__':
+      Array = jnp.array
+      {name}{args}
+  """,
+            file=file,
+        )
 
 
 def show_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
