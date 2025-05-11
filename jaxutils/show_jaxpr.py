@@ -77,12 +77,12 @@ def varstr(x):
         return str(x)
 
     if isinstance(x, jax.core.Var):
-        return str(x) + "_"
+        return f"v{x.count}{x.suffix}_"
 
     if isinstance(x, (jax.lax.GatherDimensionNumbers,)):
         return "GatherDimensionNumbers" + repr(x)
 
-    if isinstance(x, (types.FunctionType)):
+    if isinstance(x, (types.FunctionType, jax._src.linear_util.WrappedFun)):
         return x.__module__ + "." + x.__name__
 
     if x is np.float32:
@@ -100,19 +100,17 @@ def varstr(x):
 
 def pytype(x):
     if isinstance(x, jax.core.ShapedArray):
-        return (
-            f"ShapedArray({x.shape}, {x.dtype}, {x.weak_type}, {repr(x.named_shape)})"
-        )
+        return f"ShapedArray({x.shape}, {x.dtype}, {x.weak_type})"
 
     return "Any"
 
 
 # TODO:
-#             bdy_ = custom_jvp_call_jaxpr(custom_jvp_call_jaxpr1013)(bdx_, jvp_jaxpr_thunk=<function _memoize.<locals>.memoized at 0x7f8a645d2af0>, num_consts=0)
-#             bpl_ = custom_jvp_call_jaxpr(custom_jvp_call_jaxpr1019)(bpk_, jvp_jaxpr_thunk=<function _memoize.<locals>.memoized at 0x7f8a645d29d0>, num_consts=0)
-#             brc_ = iota(, dtype=int32, shape=(31, 1), dimension=0)
-#             ok_ = scatter-add(oj_,oc_,oi_, update_jaxpr={ [34m[22m[1mlambda [39m[22m[22m; a[35m:f32[39m b[35m:f32[39m. [34m[22m[1mlet[39m[22m[22m c[35m:f32[39m = add a b [34m[22m[1min [39m[22m[22m(c,) }, update_consts=(), dimension_numbers=ScatterDimensionNumbers(update_window_dims=(), inserted_window_dims=(0, 1, 2), scatter_dims_to_operand_dims=(0, 1, 2)), indices_are_sorted=True, unique_indices=True, mode=GatherScatterMode.PROMISE_IN_BOUNDS)
-#             def xla_call1003(a_: ShapedArray(float32[128,32,512]),b_: ShapedArray(int32, weak_type=True)):
+# bdy_ = custom_jvp_call_jaxpr(custom_jvp_call_jaxpr1013)(bdx_, jvp_jaxpr_thunk=<function _memoize.<locals>.memoized at 0x7f8a645d2af0>, num_consts=0)
+# bpl_ = custom_jvp_call_jaxpr(custom_jvp_call_jaxpr1019)(bpk_, jvp_jaxpr_thunk=<function _memoize.<locals>.memoized at 0x7f8a645d29d0>, num_consts=0)
+# brc_ = iota(, dtype=int32, shape=(31, 1), dimension=0)
+# ok_ = scatter-add(oj_,oc_,oi_, update_jaxpr={ [34m[22m[1mlambda [39m[22m[22m; a[35m:f32[39m b[35m:f32[39m. [34m[22m[1mlet[39m[22m[22m c[35m:f32[39m = add a b [34m[22m[1min [39m[22m[22m(c,) }, update_consts=(), dimension_numbers=ScatterDimensionNumbers(update_window_dims=(), inserted_window_dims=(0, 1, 2), scatter_dims_to_operand_dims=(0, 1, 2)), indices_are_sorted=True, unique_indices=True, mode=GatherScatterMode.PROMISE_IN_BOUNDS)
+# def xla_call1003(a_: ShapedArray(float32[128,32,512]),b_: ShapedArray(int32, weak_type=True)):
 
 from jax import lax
 import jax.numpy as jnp
@@ -164,13 +162,11 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             new_params[key] = jax.core.Literal(n, None)
 
         primname = eqn.primitive.name + "_p.bind"
-        if False and eqn.primitive is jax.interpreters.xla.xla_call_p:
-            # TODO Handle xla_call specially - essentially erase it.  TODO: do we ever need to preserve the xla_call annotations?
-            callee = new_params["call_jaxpr"]
-            translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
+        if eqn.primitive is jax._src.pjit.pjit_p:
 
-        elif eqn.primitive is jax._src.pjit.pjit_p:
-            # TODO Handle pjit_p specially - essentially erase it.  TODO: do we ever need to preserve the pjit annotations?
+            # pjits are all of the form pjit(func_var, args).
+            # Emit as func_var(args)
+            # TODO: do we ever need to preserve the pjit annotations?
             callee = new_params["jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
 
@@ -185,9 +181,110 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
 
             translation = f"{primname}({bind_args})"
 
-        print(f"{indent}{intercommavars(*eqn.outvars)} = {translation}", file=file)
+        if len(eqn.outvars):
+            print(f"{indent}{intercommavars(*eqn.outvars)} = {translation}", file=file)
+        else:
+            print(f"{indent}{translation}", file=file)
 
     print(f"{indent}return ({intercommavars(*jaxpr.outvars)})", file=file)
+
+
+from jax._src import core as jaxcore
+from jax._src import source_info_util as jaxsi
+
+
+def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
+    if var_mapping is None:
+        var_mapping = {}
+
+    def new_var(v):
+        if not deep:
+            return v
+
+        if isinstance(v, jaxcore.Var):
+            # Not cloning avals - correct?
+            if v in var_mapping:
+                return var_mapping[v]
+            else:
+                vnew = jaxcore.Var(v.suffix, v.aval)
+                var_mapping[v] = vnew
+                return vnew
+
+        assert isinstance(v, jaxcore.Literal)
+        return v
+
+    recurse = lambda x: simplify_jaxpr(x, var_mapping)
+
+    if isinstance(jaxpr, jaxcore.ClosedJaxpr):
+        return jaxcore.ClosedJaxpr(recurse(jaxpr.jaxpr), jaxpr.consts)
+
+    if isinstance(jaxpr, jaxcore.Jaxpr):
+        new_constvars = jaxpr.constvars
+
+        new_invars = [new_var(v) for v in jaxpr.invars]
+        new_outvars = [new_var(v) for v in jaxpr.outvars]
+
+        def new_eqn(eqn):
+            new_invars = [new_var(v) for v in eqn.invars]
+            new_outvars = [new_var(v) for v in eqn.outvars]
+
+            # inline
+            if eqn.primitive is jax._src.pjit.pjit_p:
+                callee = eqn.params["jaxpr"].jaxpr
+                if len(callee.eqns) < 7:
+                    # rename variables in the callee
+                    invars_mapping = {
+                        inner: value for inner, value in zip(callee.invars, new_invars)
+                    }
+                    outvars_mapping = {
+                        inner: here for inner, here in zip(callee.outvars, new_outvars)
+                    }
+                    assert len(invars_mapping.keys() & outvars_mapping.keys()) == 0
+
+                    new_callee = simplify_jaxpr(
+                        callee, invars_mapping | outvars_mapping
+                    )
+
+                    return new_callee.eqns
+
+            def new_param(p):
+                if isinstance(p, (jaxcore.Jaxpr, jaxcore.ClosedJaxpr)):
+                    return recurse(p)
+                else:
+                    return p
+
+            new_params = {k: new_param(param) for k, param in eqn.params.items()}
+
+            new_source_info = jaxsi.SourceInfo(
+                eqn.source_info.traceback, eqn.source_info.name_stack.extend("simplify")
+            )
+
+            new_eqn = jaxcore.JaxprEqn(
+                new_invars,
+                new_outvars,
+                eqn.primitive,
+                new_params,
+                eqn.effects,
+                new_source_info,
+                eqn.ctx,
+            )
+
+            return [new_eqn]
+
+        new_eqns = list(eqn for eqn0 in jaxpr.eqns for eqn in new_eqn(eqn0))
+
+        new_effects = jaxpr.effects
+        new_debug_info = jaxpr.debug_info
+        return jaxcore.Jaxpr(
+            new_constvars,
+            new_invars,
+            new_outvars,
+            new_eqns,
+            new_effects,
+            new_debug_info,
+        )
+
+    assert False, f"Don't know how to simplify {jaxpr} of type {type(jaxpr)}"
 
 
 def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
@@ -202,7 +299,8 @@ def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
 from jax.lax import *
 from jax.lax import transpose_p
 import jax.numpy as jnp
-from numpy import float32,int32
+from numpy import float32,int32,nan
+import numpy as np
 
 add_any_p = add_p
 
@@ -215,9 +313,32 @@ add_any_p = add_p
 
     doc = f.__doc__
 
-    jaxpr = jax.make_jaxpr(f, **kwargs)
-    closed_jaxpr = jaxpr(*args)
-    examine_jaxpr(name, closed_jaxpr.jaxpr, doc=doc, file=file)
+    make_jaxpr = jax.make_jaxpr(f, **kwargs)
+    closed_jaxpr = make_jaxpr(*args)
+    print("simplify ...")
+    simple_closed_jaxpr = simplify_jaxpr(closed_jaxpr)
+    print("simplify ... done")
+
+    # run it...
+    nonstatic_args = args
+    if "static_argnums" in kwargs:
+        static_argnums = kwargs["static_argnums"]
+        if not isinstance(static_argnums, (list, tuple)):
+            static_argnums = [static_argnums]
+        nonstatic_arg_inds = set(range(len(args))) - set(static_argnums)
+        nonstatic_args = [args[i] for i in nonstatic_arg_inds]
+
+    flatargs = jax.tree.flatten(nonstatic_args)[0]  # TODO, hack static argum =1
+    print("eval1 ...")
+    ans1 = jaxcore.eval_jaxpr(closed_jaxpr.jaxpr, closed_jaxpr.consts, *flatargs)
+    print("eval2 ...")
+    ans2 = jaxcore.eval_jaxpr(
+        simple_closed_jaxpr.jaxpr, simple_closed_jaxpr.consts, *flatargs
+    )
+    ok = jax.tree.map(jnp.allclose, ans1, ans2)
+    assert all(ok)
+
+    examine_jaxpr(name, simple_closed_jaxpr.jaxpr, doc=doc, file=file)
 
     print(
         f"""
@@ -266,7 +387,7 @@ def test_basic():
     print(f(*args))
 
     show_jaxpr(f, args, name="f")
-    show_xla(f, args)
+    # show_xla(f, args)
     # show_xla(f, args, optimized=True)
 
 
