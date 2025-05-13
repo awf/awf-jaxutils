@@ -131,8 +131,19 @@ from jax import lax
 import jax.numpy as jnp
 from icecream import ic
 
+prim_as_python_map = {
+    lax.log_p: lambda x, accuracy=None: (
+        f"jnp.log({x})" if accuracy is None else f"jnp.log({x}, {accuracy=})"
+    ),
+    lax.lt_p: lambda x, y: f"{x} < {y}",
+    lax.add_p: lambda x, y: f"{x} + {y}",
+    lax.mul_p: lambda x, y: f"{x} * {y}",
+    lax.sub_p: lambda x, y: f"{x} - {y}",
+    lax.div_p: lambda x, y: f"{x} / {y}",
+}
 
-def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
+
+def print_jaxpr_as_python(f, jaxpr, *, indent="", doc="", file=sys.stdout):
     args = intercomma(*(varstr(v) + f": '{pytype(v.aval)}'" for v in jaxpr.invars))
     print(f"\n{indent}def {f}({args}):", file=file)
     indent += tab
@@ -148,11 +159,12 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
         new_params = {}
         for key, val in eqn.params.items():
             if isinstance(val, tuple):
-                assert not any(
-                    isJaxpr(x) for x in val
-                ), "Don't expect sub_jaxprs in tuples"
+                # We don't expect sub_jaxprs in tuples
+                assert not any(isJaxpr(x) for x in val)
 
-            # Special cases: scatter-add
+            # Special cases: the jaxprs in scatter-add are not handled at the moment
+            # print them and allow the user to see where they occur.
+            # scatter-adds which don't use the jaxprs are handled as normal
             if eqn.primitive is lax.scatter_add_p and key in (
                 "update_jaxpr",
                 "update_consts",
@@ -162,21 +174,23 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             if sub_jaxpr := subJaxpr(val):
                 # Sub-jaxpr, make a name, and recurse
                 if "name" in eqn.params:
-                    n = new_name(
-                        pythonize(eqn.primitive.name + "_" + eqn.params["name"])
-                    )
+                    nm = eqn.primitive.name + "_" + eqn.params["name"]
                 else:
-                    n = new_name(pythonize(eqn.primitive.name))
+                    nm = eqn.primitive.name
 
+                nm = new_name(pythonize(nm))
                 doc = doc_from_source_line(eqn.source_info)
-                examine_jaxpr(n, sub_jaxpr, indent=indent, doc=doc, file=file)
+                # recurse, generating
+                #    def myfunc0012(...):
+                #       ...
+                print_jaxpr_as_python(nm, sub_jaxpr, indent=indent, doc=doc, file=file)
+                # and replace jaxpr val with literal name, so call will become
+                # y = custom_jvp_call(..., call_jaxpr=myfunc0012, ...)
+                val = jaxcore.Literal(nm, None)
 
-                new_params[key] = jaxcore.Literal(n, None)
-            else:
-                # Not a sub-jaxpr, just use the value
-                new_params[key] = val
+            # Add val to new_params
+            new_params[key] = val
 
-        primname = eqn.primitive.name + "_p.bind"
         if eqn.primitive is jaxsrc.pjit.pjit_p:
 
             # pjits are all of the form pjit(func_var, args).
@@ -185,16 +199,21 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             callee = new_params["jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
 
+        elif eqn.primitive in prim_as_python_map:
+            mkpy = prim_as_python_map[eqn.primitive]
+            translation = mkpy(
+                *map(varstr, eqn.invars),
+                **{k: varstr(v) for (k, v) in new_params.items()},
+            )
+
         else:
-            if eqn.primitive is lax.scatter_add_p:
-                primname = "scatter_add"
 
             bind_args = intercomma(
                 *(f"{varstr(v)}" for v in eqn.invars),
                 *(f"{n}={varstr(v)}" for (n, v) in new_params.items()),
             )
 
-            translation = f"{primname}({bind_args})"
+            translation = f"{get_primitive_name(eqn)}({bind_args})"
 
         if len(eqn.outvars):
             print(f"{indent}{intercommavars(*eqn.outvars)} = {translation}", file=file)
@@ -202,6 +221,21 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             print(f"{indent}{translation}", file=file)
 
     print(f"{indent}return ({intercommavars(*jaxpr.outvars)})", file=file)
+
+
+def get_primitive_name(eqn):
+    if eqn.primitive is lax.scatter_add_p:
+        return "scatter_add"
+
+    if eqn.primitive in (
+        lax.select_n_p,
+        lax.broadcast_in_dim_p,
+        lax.gather_p,
+        lax.reduce_sum_p,
+    ):
+        return eqn.primitive.name
+
+    return eqn.primitive.name + "_p.bind"
 
 
 def inline_jaxpr(eqn, new_eqn_invars, new_eqn_outvars, var_mapping):
@@ -225,7 +259,7 @@ def inline_jaxpr(eqn, new_eqn_invars, new_eqn_outvars, var_mapping):
     elif eqn.primitive is jaxsrc.custom_derivatives.custom_jvp_call_p:
         callee = eqn.params["call_jaxpr"].jaxpr
 
-    if len(callee.eqns) > 1:
+    if len(callee.eqns) > 0:
         return None
 
     print(f"Inlining jaxpr {callee} {eqn.params['name']}")
@@ -393,7 +427,7 @@ add_any_p = add_p
     except Exception as e:
         print("Error evaluating jaxpr", e)
 
-    examine_jaxpr(name, closed_jaxpr.jaxpr, doc=doc, file=file)
+    print_jaxpr_as_python(name, closed_jaxpr.jaxpr, doc=doc, file=file)
 
     if add_consts:
         print(
