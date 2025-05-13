@@ -6,19 +6,7 @@ from functools import lru_cache
 
 import jax
 import jaxlib
-import jaxlib.xla_extension as xla_ext
 
-if jaxlib.version.__version__ <= "0.4":
-    from jax.experimental import pjit
-
-    xla_call_p = jax.interpreters.xla.xla_call_p
-    import jax.core as jaxcore
-else:
-    import jax._src
-    import jax._src.core as jaxcore
-    from jax._src import pjit
-
-import jaxlib.xla_extension as xla_ext
 import jax._src as jaxsrc
 from jax.extend import core as jaxcore
 from jax._src import source_info_util as jaxsi
@@ -214,7 +202,7 @@ def print_jaxpr_as_python(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             callee = new_params["call_jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
 
-        elif eqn.primitive is pjit.pjit_p:
+        elif eqn.primitive is jaxsrc.pjit.pjit_p:
             # TODO Handle pjit_p specially - essentially erase it.  TODO: do we ever need to preserve the pjit annotations?
             callee = new_params["jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
@@ -247,12 +235,15 @@ def get_primitive_name(eqn):
     if eqn.primitive is lax.scatter_add_p:
         return "scatter_add"
 
-    if False and (eqn.primitive in (
-        lax.select_n_p,
-        lax.broadcast_in_dim_p,
-        lax.gather_p,
-        lax.reduce_sum_p,
-    )):
+    if False and (
+        eqn.primitive
+        in (
+            lax.select_n_p,
+            lax.broadcast_in_dim_p,
+            lax.gather_p,
+            lax.reduce_sum_p,
+        )
+    ):
         return eqn.primitive.name
 
     return eqn.primitive.name + "_p.bind"
@@ -402,7 +393,6 @@ def show_jaxpr(
     if add_decls:
         print(
             f"""
-#fmt: off
 # show_jaxpr {f}
 from numpy import float32,int32
 from jax.lax import *

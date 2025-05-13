@@ -10,26 +10,12 @@ from beartype import beartype
 import pytest
 
 import jax
-import jaxlib
-
-if jaxlib.version.__version__ <= "0.4":
-    from jax.experimental import pjit
-    from jax.interpreters import pxla
-    import jax.core as jaxcore
-
-    xla_call_p = jax.interpreters.xla.xla_call_p
-else:
-    import jax._src
-    import jax._src.core as jaxcore
-    from jax._src import pjit
-    import jaxlib.xla_extension as xla_ext
-
-    xla_call_p = None
-
-from pprint import pprint
-
 from jax import lax
 import jax.numpy as jnp
+import jax._src as jaxsrc
+from jax.extend import core as jaxcore
+
+from pprint import pprint
 
 import jaxutils
 from jaxutils.expr import Expr, Var, Const, Lambda, Let, Call, mkTuple
@@ -51,14 +37,6 @@ else:
     unparse = astunparse.unparse
 
 
-def tree_all(t):
-    return all(jax.tree_util.tree_leaves(t))
-
-
-def unspecified(x):
-    return tree_all(jax.tree_map(jax._src.sharding_impls.is_unspecified, x))
-
-
 def kwargs_to_dict_call(dict):
     if not dict:
         return []
@@ -74,17 +52,17 @@ def new_call(fn: str, *args, **kwargs):
     return Call(Var(fn), list(args) + kwargs_to_dict_call(kwargs))
 
 
-translators: Dict[jax.core.Primitive, Callable[..., Optional[Expr]]] = {}
+translators: Dict[jaxcore.Primitive, Callable[..., Optional[Expr]]] = {}
 
 
 @dictassign(translators, lax.convert_element_type_p)
-def _(val, new_dtype=None, weak_type=False):
+def _(val, new_dtype=None, weak_type=False, sharding=None):
     if weak_type.val == False:
         return new_call("convert_element_type", val, new_dtype)
 
 
 @dictassign(translators, lax.broadcast_in_dim_p)
-def _(val, shape=None, broadcast_dimensions=None):
+def _(val, shape=None, broadcast_dimensions=None, sharding=None):
     return new_call("broadcast_in_dim", val, shape, broadcast_dimensions)
 
 
@@ -102,7 +80,14 @@ def _(val, start_indices=None, limit_indices=None, strides=None):
 
 
 @dictassign(translators, lax.dot_general_p)
-def _(a, b, dimension_numbers=None, precision=None, preferred_element_type=None):
+def _(
+    a,
+    b,
+    dimension_numbers=None,
+    precision=None,
+    preferred_element_type=None,
+    out_sharding=None,
+):
     if precision.val is None and preferred_element_type.val is None:
         # TODO Reverse-engineer to matmul where that's true, and if kwargs are default
         # mm_pattern = (((1,), (0,)), ((), ()))
@@ -125,7 +110,12 @@ def _(a, b, dimension_numbers=None, precision=None, preferred_element_type=None)
 translate_pjit_passthru = True
 
 
-@dictassign(translators, pjit.pjit_p)
+def unspecified(xs):
+    is_unspec = lambda x: isinstance(x, jax._src.named_sharding.UnspecifiedValue)
+    return jax.tree.all(jax.tree.map(is_unspec, xs))
+
+
+@dictassign(translators, jaxsrc.pjit.pjit_p)
 def _(
     *args,
     jaxpr=None,
@@ -136,6 +126,10 @@ def _(
     name="",
     keep_unused=False,
     inline=False,
+    in_layouts=None,
+    out_layouts=None,
+    compiler_options_kvs=None,
+    ctx_mesh=None,
 ):
     # Elide the call if the shardings are unspecified
     if (
@@ -187,17 +181,17 @@ def _(*args, **kwargs):
     return new_call("scatter_add", *args, dimension_numbers, **kwargs)
 
 
-if xla_call_p:
+# if xla_call_p:
 
-    @dictassign(translators, xla_call_p)
-    def _(*args, **kwargs):
-        call_jaxpr = kwargs.pop("call_jaxpr")
-        # TODO:
-        #   1. check all kwargs are benign before erasing
-        #   2. make this work if needed
-        #      xla_call_p wants the jaxpr pulled out of kwargs
-        #      return Call(Var("xla_call_p.bind"), [call_jaxpr, *args] + kwargs_to_dict_call(kwargs))
-        return Call(call_jaxpr, list(args))
+#     @dictassign(translators, xla_call_p)
+#     def _(*args, **kwargs):
+#         call_jaxpr = kwargs.pop("call_jaxpr")
+#         # TODO:
+#         #   1. check all kwargs are benign before erasing
+#         #   2. make this work if needed
+#         #      xla_call_p wants the jaxpr pulled out of kwargs
+#         #      return Call(Var("xla_call_p.bind"), [call_jaxpr, *args] + kwargs_to_dict_call(kwargs))
+#         return Call(call_jaxpr, list(args))
 
 
 def jaxpr_to_expr(jaxpr) -> Lambda:
@@ -230,6 +224,19 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
     return Lambda(args, body)
 
 
+import functools
+
+
+varname_n = 0
+
+
+@functools.lru_cache
+def varname(x):
+    global varname_n
+    varname_n += 1
+    return f"v{varname_n:02x}"
+
+
 def jaxpr_to_expr_aux(x) -> Expr:
     if x is None or isinstance(
         x,
@@ -259,7 +266,10 @@ def jaxpr_to_expr_aux(x) -> Expr:
 
     if isinstance(x, jaxcore.Var):
         # return Var(f"v_{x.count+11}{x.suffix}")
-        return Var(f"v_{x}")
+        return Var(varname(x))
+
+    if isinstance(x, types.FunctionType):
+        return Const(str(x))
 
     # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
     # Explicitly add verified cases to
@@ -280,7 +290,14 @@ def test_jaxutils_p2d():
 
 
 def show_jaxpr(
-    f, args, name=None, file=sys.stdout, add_decls=None, optimize=True, static_argnums=(), **kwargs
+    f,
+    args,
+    name=None,
+    file=sys.stdout,
+    add_decls=None,
+    optimize=True,
+    static_argnums=(),
+    **kwargs,
 ):
     """
     Show jaxpr f as if in python, i.e. "decompile" to python
@@ -298,8 +315,8 @@ def show_jaxpr(
     # Add decls if saving to file, but not to screen
     our_file = None
     if isinstance(file, str):
-        our_file = open(file, 'w')
-        print(f'show_jaxpr: Saving to [{file}]')
+        our_file = open(file, "w")
+        print(f"show_jaxpr: Saving to [{file}]")
         file = our_file
 
     if add_decls == None:
@@ -324,19 +341,7 @@ from jax.lax import *
 from jax.lax import transpose_p
 import jax.numpy as jnp
 import jax
-import jaxlib
-if jaxlib.version.__version__ <= "0.4":
-    from jax.experimental import pjit
-    from jax.interpreters import pxla
-    from jax.interpreters.xla import xla_call_p
-    import jax.core as jaxcore
-    DeviceArray = jnp.array
-else:
-    import jax._src
-    import jax._src.core as jaxcore
-    from jax._src import pjit
-    import jaxlib.xla_extension as xla_ext
-    Array = jnp.array
+import numpy as np
 
 nan = jnp.nan
 array = jnp.array
@@ -354,23 +359,24 @@ from jax._src.ad_util import add_any_p
 
     numpy.set_printoptions(threshold=1e6)  # more than that, let's think about pickling
     if add_decls:
-      non_static_args = [*args]
-      if static_argnums:
-        del non_static_args[static_argnums]
-      flat_args = jax.tree_util.tree_leaves(non_static_args)
-      test_args = ",".join(repr(arg) for arg in flat_args)
+        non_static_args = [*args]
+        if static_argnums:
+            del non_static_args[static_argnums]
+        flat_args = jax.tree_util.tree_leaves(non_static_args)
+        test_args = ",".join(repr(arg) for arg in flat_args)
 
-      print(
-          f"""
+        print(
+            f"""
 if __name__ == '__main__':
     {name}({test_args})
 """,
-          file=file,
-      )
+            file=file,
+        )
 
     if add_decls:
         # Dump jaxpr too
-        print("""
+        print(
+            """
 ###############################################################################
 #                                                                             #
 #                       #   ##   #    # #####  #####                          #
@@ -381,13 +387,16 @@ if __name__ == '__main__':
 #                   ####  #    # #    # #      #    #                         #
 #                                                                             #
 ###############################################################################
-""", file=file)
+""",
+            file=file,
+        )
 
         print('jaxpr  = """', closed_jaxpr, '"""', file=file)
 
     if add_decls:
         # Dump XLA too
-        print("""
+        print(
+            """
 ###############################################################################
 #                                                                             #
 #                          #    # #       ####                                #
@@ -398,19 +407,19 @@ if __name__ == '__main__':
 #                          #    # ######  ####                                #
 #                                                                             #
 ###############################################################################
-""", file=file)
 
-        import jaxlib.xla_extension as xla_ext
+# is broken - see https://github.com/jax-ml/jax/discussions/7068
+""",
+            file=file,
+        )
 
-        xc = jax.xla_computation(f, static_argnums=static_argnums)(*args)
-
-        backend = jax.lib.xla_bridge.get_backend()
-        e = backend.compile(xc)
-        module = e.hlo_modules()[0]
+        # xc = closed_jaxpr.lower(*args)
+        # e = xc.compile()
+        # module = e.hlo_modules()[0]
 
         # You could use the presets
-        option = xla_ext.HloPrintOptions.short_parsable()
-        print('hlo_module  = """', module.to_string(option), '"""', file=file)
+        # option = xla_ext.HloPrintOptions.short_parsable()
+        # print('hlo_module  = """', e.as_text(), '"""', file=file)
 
         # option = xla_ext.HloPrintOptions.canonical()
         # print(module.to_string(option))
@@ -423,8 +432,6 @@ if __name__ == '__main__':
         # option.print_metadata = False
         # option.include_layout_in_shapes = False
         # print(module.to_string(option))
-
-
 
     if our_file:
         our_file.close()

@@ -43,12 +43,19 @@ def dictassign(d: Dict[Any, Callable], key: Any):
 
     def wrapper(func):
         d[key] = func
+
         if func.__name__ == "_":
             newname = "_@dictassign_" + str(key)
             func.__name__ = newname
             func.__code__ = func.__code__.replace(co_name=newname)
 
-        return None
+            if func.__qualname__ != "_":
+                print(f"NOTE: {func.__qualname__} not overridden")
+
+            if func.__qualname__ == "_":
+                func.__qualname__ = newname
+
+        return func
 
     return wrapper
 
