@@ -15,13 +15,13 @@ class ParamsDict(types.SimpleNamespace):
         super().__init__(**kwargs)
 
     def tree_flatten(self):
-        return jax.tree_flatten(
+        return jax.tree.flatten(
             self.__dict__, lambda a: a is not self.__dict__
         )  # only flatten one step
 
     @classmethod
     def tree_unflatten(cls, aux, values):
-        return ParamsDict(**jax.tree_unflatten(aux, values))
+        return ParamsDict(**jax.tree.unflatten(aux, values))
 
     def toJSON(self):
         return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True, indent=4)

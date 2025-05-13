@@ -18,7 +18,7 @@ class AdamState(NamedTuple):
 
 
 class Adam:
-    """
+    r"""
     <a id="Adam"></a>
 
     ## Adam Optimizer
@@ -63,7 +63,7 @@ class Adam:
         self.eps = eps
 
         # States for each parameter
-        self.states = jax.tree_map(self._init_state, params)
+        self.states = jax.tree.map(self._init_state, params)
         # Optimized step function
         self._step_jit = jax.jit(self._step)
         # Number of steps taken $t$
@@ -87,9 +87,9 @@ class Adam:
         # Increment step $t$
         self._n_steps += 1
         # Update states for each parameter
-        self.states = jax.tree_map(self._update_state_jit, grads, self.states)
+        self.states = jax.tree.map(self._update_state_jit, grads, self.states)
         # Return updated parameters $\theta_t$
-        return jax.tree_map(partial(self._step_jit, self._n_steps), params, self.states)
+        return jax.tree.map(partial(self._step_jit, self._n_steps), params, self.states)
 
     def _step(self, n_steps: int, param: jnp.ndarray, state: AdamState):
         """

@@ -17,11 +17,11 @@ def allclose(ref, test, rtol, atol, verbose=False):
 
 
 def tree_close(tref, ttest, rtol, atol, verbose=True):
-    return jax.tree_map(lambda a, b: allclose(a, b, rtol, atol, verbose), ttest, tref)
+    return jax.tree.map(lambda a, b: allclose(a, b, rtol, atol, verbose), ttest, tref)
 
 
 def tree_all(t):
-    return all(jax.tree_util.tree_leaves(t))
+    return all(jax.tree.leaves(t))
 
 
 def tree_allclose(tref, ttest, rtol, atol, verbose=True):

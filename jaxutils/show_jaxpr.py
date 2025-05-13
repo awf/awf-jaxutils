@@ -5,6 +5,21 @@ import numpy as np
 
 import jax
 import jaxlib.xla_extension as xla_ext
+import jax._src as jaxsrc
+from jax.extend import core as jaxcore
+from jax._src import source_info_util as jaxsi
+
+
+def isJaxpr(x):
+    return isinstance(x, (jaxcore.Jaxpr, jaxcore.ClosedJaxpr))
+
+
+def subJaxpr(x):
+    if isinstance(x, jaxcore.Jaxpr):
+        return x
+    if isinstance(x, jaxcore.ClosedJaxpr):
+        return x.jaxpr
+    return None
 
 
 def cat(xs):
@@ -67,7 +82,7 @@ def varstr(x):
         x,
         (
             jax.core.DropVar,
-            jax.core.Literal,
+            jaxcore.Literal,
             tuple,
             type(None),
             jax.numpy.dtype,
@@ -76,13 +91,13 @@ def varstr(x):
     ):
         return str(x)
 
-    if isinstance(x, jax.core.Var):
+    if isinstance(x, jaxcore.Var):
         return f"v{x.count}{x.suffix}_"
 
     if isinstance(x, (jax.lax.GatherDimensionNumbers,)):
         return "GatherDimensionNumbers" + repr(x)
 
-    if isinstance(x, (types.FunctionType, jax._src.linear_util.WrappedFun)):
+    if isinstance(x, (types.FunctionType, jaxsrc.linear_util.WrappedFun)):
         return x.__module__ + "." + x.__name__
 
     if x is np.float32:
@@ -134,7 +149,7 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
         for key, val in eqn.params.items():
             if isinstance(val, tuple):
                 assert not any(
-                    isinstance(x, (jax.core.Jaxpr, jax.core.ClosedJaxpr)) for x in val
+                    isJaxpr(x) for x in val
                 ), "Don't expect sub_jaxprs in tuples"
 
             # Special cases: scatter-add
@@ -144,25 +159,25 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             ):
                 continue
 
-            if isinstance(val, jax.core.Jaxpr):
-                sub_jaxpr = val
-            elif isinstance(val, jax.core.ClosedJaxpr):
-                sub_jaxpr = val.jaxpr
+            if sub_jaxpr := subJaxpr(val):
+                # Sub-jaxpr, make a name, and recurse
+                if "name" in eqn.params:
+                    n = new_name(
+                        pythonize(eqn.primitive.name + "_" + eqn.params["name"])
+                    )
+                else:
+                    n = new_name(pythonize(eqn.primitive.name))
+
+                doc = doc_from_source_line(eqn.source_info)
+                examine_jaxpr(n, sub_jaxpr, indent=indent, doc=doc, file=file)
+
+                new_params[key] = jaxcore.Literal(n, None)
             else:
-                # No sub_jaxpr - just update new_params and continue
+                # Not a sub-jaxpr, just use the value
                 new_params[key] = val
-                continue
-
-            # Sub-jaxpr, make a name, and recurse
-            n = new_name(pythonize(eqn.primitive.name))
-
-            doc = doc_from_source_line(eqn.source_info)
-            examine_jaxpr(n, sub_jaxpr, indent=indent, doc=doc, file=file)
-
-            new_params[key] = jax.core.Literal(n, None)
 
         primname = eqn.primitive.name + "_p.bind"
-        if eqn.primitive is jax._src.pjit.pjit_p:
+        if eqn.primitive is jaxsrc.pjit.pjit_p:
 
             # pjits are all of the form pjit(func_var, args).
             # Emit as func_var(args)
@@ -189,13 +204,64 @@ def examine_jaxpr(f, jaxpr, *, indent="", doc="", file=sys.stdout):
     print(f"{indent}return ({intercommavars(*jaxpr.outvars)})", file=file)
 
 
-from jax._src import core as jaxcore
-from jax._src import source_info_util as jaxsi
+def inline_jaxpr(eqn, new_eqn_invars, new_eqn_outvars, var_mapping):
+    if eqn.primitive not in (
+        jaxsrc.pjit.pjit_p,
+        # jaxsrc.custom_derivatives.custom_jvp_call_p,
+    ):
+        return None
+
+    # Inlining call
+    #   new_os = foo(new_is)
+    # where foo is
+    #   inner_os[1] = bar(inner_is[0], inner_is[1])
+    #   inner_os[0] = bar(inner_os[1], inner_is[1])
+    # So we rewrite the body to
+    #   new_os[1] = bar(new_is[0], new_is[1])
+    #   new_os[0] = bar(new_os[1], new_is[1])
+
+    if eqn.primitive is jaxsrc.pjit.pjit_p:
+        callee = eqn.params["jaxpr"].jaxpr
+    elif eqn.primitive is jaxsrc.custom_derivatives.custom_jvp_call_p:
+        callee = eqn.params["call_jaxpr"].jaxpr
+
+    if len(callee.eqns) > 1:
+        return None
+
+    print(f"Inlining jaxpr {callee} {eqn.params['name']}")
+
+    # rename variables in the callee
+    invars_mapping = {
+        inner: value for inner, value in zip(callee.invars, new_eqn_invars)
+    }
+    outvars_mapping = {
+        inner: here
+        for inner, here in zip(callee.outvars, new_eqn_outvars)
+        if inner not in invars_mapping
+    }
+
+    for aliased_outvar, new_eqn_outvar in zip(callee.outvars, new_eqn_outvars):
+        if aliased_outvar in callee.invars:
+            # map new_outvar[i] to new_invar[i] for the rest of the translation
+            invar = invars_mapping[aliased_outvar]
+            for k, v in var_mapping.items():
+                if v == new_eqn_outvar:
+                    var_mapping[k] = invar
+            var_mapping[new_eqn_outvar] = invar
+
+    new_callee = simplify_jaxpr(callee, outvars_mapping | invars_mapping)
+
+    return new_callee.eqns
 
 
 def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
     if var_mapping is None:
         var_mapping = {}
+
+    recurse = lambda x: simplify_jaxpr(x, var_mapping)
+
+    if isinstance(jaxpr, jaxcore.ClosedJaxpr):
+        return jaxcore.ClosedJaxpr(recurse(jaxpr.jaxpr), jaxpr.consts)
 
     def new_var(v):
         if not deep:
@@ -213,11 +279,6 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
         assert isinstance(v, jaxcore.Literal)
         return v
 
-    recurse = lambda x: simplify_jaxpr(x, var_mapping)
-
-    if isinstance(jaxpr, jaxcore.ClosedJaxpr):
-        return jaxcore.ClosedJaxpr(recurse(jaxpr.jaxpr), jaxpr.consts)
-
     if isinstance(jaxpr, jaxcore.Jaxpr):
         new_constvars = jaxpr.constvars
 
@@ -225,30 +286,18 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
         new_outvars = [new_var(v) for v in jaxpr.outvars]
 
         def new_eqn(eqn):
-            new_invars = [new_var(v) for v in eqn.invars]
-            new_outvars = [new_var(v) for v in eqn.outvars]
+            new_eqn_invars = [new_var(v) for v in eqn.invars]
+            new_eqn_outvars = [new_var(v) for v in eqn.outvars]
 
-            # inline
-            if eqn.primitive is jax._src.pjit.pjit_p:
-                callee = eqn.params["jaxpr"].jaxpr
-                if len(callee.eqns) < 7:
-                    # rename variables in the callee
-                    invars_mapping = {
-                        inner: value for inner, value in zip(callee.invars, new_invars)
-                    }
-                    outvars_mapping = {
-                        inner: here for inner, here in zip(callee.outvars, new_outvars)
-                    }
-                    assert len(invars_mapping.keys() & outvars_mapping.keys()) == 0
-
-                    new_callee = simplify_jaxpr(
-                        callee, invars_mapping | outvars_mapping
-                    )
-
-                    return new_callee.eqns
+            # inline the "direct call" primitives pjit and custom_jvp_call
+            inlined_eqns = inline_jaxpr(
+                eqn, new_eqn_invars, new_eqn_outvars, var_mapping
+            )
+            if inlined_eqns is not None:
+                return inlined_eqns
 
             def new_param(p):
-                if isinstance(p, (jaxcore.Jaxpr, jaxcore.ClosedJaxpr)):
+                if isJaxpr(p):
                     return recurse(p)
                 else:
                     return p
@@ -260,8 +309,8 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
             )
 
             new_eqn = jaxcore.JaxprEqn(
-                new_invars,
-                new_outvars,
+                new_eqn_invars,
+                new_eqn_outvars,
                 eqn.primitive,
                 new_params,
                 eqn.effects,
@@ -287,14 +336,19 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
     assert False, f"Don't know how to simplify {jaxpr} of type {type(jaxpr)}"
 
 
-def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, **kwargs):
+def show_jaxpr(
+    f, args, name=None, file=sys.stdout, add_decls=False, add_consts=True, **kwargs
+):
     """
     Show jaxpr f as if in python, i.e. "decompile" to python
     """
 
+    print("#fmt: off", file=file)
+
     if add_decls:
         print(
             f"""
+#fmt: off
 # show_jaxpr {f}
 from jax.lax import *
 from jax.lax import transpose_p
@@ -313,41 +367,43 @@ add_any_p = add_p
 
     doc = f.__doc__
 
-    make_jaxpr = jax.make_jaxpr(f, **kwargs)
-    closed_jaxpr = make_jaxpr(*args)
+    jaxpr = jax.make_jaxpr(f, **kwargs)
+    closed_jaxpr = jaxpr(*args)
     print("simplify ...")
-    simple_closed_jaxpr = simplify_jaxpr(closed_jaxpr)
+    closed_jaxpr = simplify_jaxpr(closed_jaxpr)
     print("simplify ... done")
 
     # run it...
-    nonstatic_args = args
-    if "static_argnums" in kwargs:
-        static_argnums = kwargs["static_argnums"]
-        if not isinstance(static_argnums, (list, tuple)):
-            static_argnums = [static_argnums]
-        nonstatic_arg_inds = set(range(len(args))) - set(static_argnums)
-        nonstatic_args = [args[i] for i in nonstatic_arg_inds]
+    try:
+        nonstatic_args = args
+        if "static_argnums" in kwargs:
+            static_argnums = kwargs["static_argnums"]
+            if not isinstance(static_argnums, (list, tuple)):
+                static_argnums = [static_argnums]
+            nonstatic_arg_inds = set(range(len(args))) - set(static_argnums)
+            nonstatic_args = [args[i] for i in nonstatic_arg_inds]
 
-    flatargs = jax.tree.flatten(nonstatic_args)[0]  # TODO, hack static argum =1
-    print("eval1 ...")
-    ans1 = jaxcore.eval_jaxpr(closed_jaxpr.jaxpr, closed_jaxpr.consts, *flatargs)
-    print("eval2 ...")
-    ans2 = jaxcore.eval_jaxpr(
-        simple_closed_jaxpr.jaxpr, simple_closed_jaxpr.consts, *flatargs
-    )
-    ok = jax.tree.map(jnp.allclose, ans1, ans2)
-    assert all(ok)
+        flatargs = jax.tree.flatten(nonstatic_args)[0]  # TODO, hack static argum =1
+        print("eval1 ...")
+        ans1 = jax.core.eval_jaxpr(closed_jaxpr.jaxpr, closed_jaxpr.consts, *flatargs)
+        print("eval2 ...")
+        ans2 = jax.core.eval_jaxpr(closed_jaxpr.jaxpr, closed_jaxpr.consts, *flatargs)
+        ok = jax.tree.map(jnp.allclose, ans1, ans2)
+        assert all(ok)
+    except Exception as e:
+        print("Error evaluating jaxpr", e)
 
-    examine_jaxpr(name, simple_closed_jaxpr.jaxpr, doc=doc, file=file)
+    examine_jaxpr(name, closed_jaxpr.jaxpr, doc=doc, file=file)
 
-    print(
-        f"""
+    if add_consts:
+        print(
+            f"""
 if __name__ == '__main__':
     Array = jnp.array
     {name}{args}
 """,
-        file=file,
-    )
+            file=file,
+        )
 
 
 def show_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
