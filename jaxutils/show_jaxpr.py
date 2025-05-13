@@ -232,12 +232,12 @@ def get_primitive_name(eqn):
     if eqn.primitive is lax.scatter_add_p:
         return "scatter_add"
 
-    if eqn.primitive in (
+    if False and (eqn.primitive in (
         lax.select_n_p,
         lax.broadcast_in_dim_p,
         lax.gather_p,
         lax.reduce_sum_p,
-    ):
+    )):
         return eqn.primitive.name
 
     return eqn.primitive.name + "_p.bind"
