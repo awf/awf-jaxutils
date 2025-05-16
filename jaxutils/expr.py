@@ -195,7 +195,10 @@ def mkvars(s: str) -> Tuple[Var]:
     return [Var(s) for s in s.split(",")]
 
 
-def transform(transformer: Callable[[Expr], Expr], e: Expr):
+def transform(transformer: Callable[[Expr], Expr], e: Expr = None):
+    if e is None:
+        return lambda e: transform(transformer, e)
+
     recurse = lambda e: transform(transformer, e)
 
     # Recurse into children
@@ -306,11 +309,16 @@ def test_visit():
     preorder_visit(e, lambda x: print(type(x)))
 
 
+### Global functions
+g_tuple = Var("g_tuple")
+g_identity = Var("g_identity")
+
+
 def mkTuple(es: List[Expr]) -> Expr:
     if len(es) == 1:
         return es[0]
     else:
-        return Call(Var("tuple"), es)
+        return Call(g_tuple, es)
 
 
 ### Optimizations
@@ -324,11 +332,22 @@ def inline_call_of_lambda(e: Expr) -> Expr:
         return Let([Eqn(e.f.args, mkTuple(e.args))], e.f.body)
 
 
+def inline_lambda_of_let_of_call(e: Expr) -> Expr:
+    # lambda args: let eqns in call(f, args)
+    #  ->  let eqns in f
+    # Name clashes will happen unless all bound var names were uniquified
+    if e.isLambda and e.body.isLet and e.body.body.isCall:
+        if e.body.body.args == e.args:
+            return Let(e.body.eqns, e.body.body.f)
+
+
 def inline_trivial_letbody(e: Expr) -> Expr:
     # let var = val in var -> val
     if e.isLet and len(e.eqns) == 1 and len(e.eqns[0].vars) == 1:
-        if e.eqns[0].vars[0] == e.body:
+        if e.eqns[0].vars == [e.body]:
             return e.eqns[0].val
+    if e.isLet and len(e.eqns) == 0:
+        return e.body
 
 
 def inline_lambda_of_call(e: Expr) -> Expr:
@@ -352,7 +371,7 @@ def detuple_tuple_assignments(e: Expr) -> Expr:
     def detuple_eqn(eqn):
         vars = eqn.vars
         val = eqn.val
-        if len(vars) > 1 and val.isCall and val.f == Var("tuple"):
+        if len(vars) > 1 and val.isCall and val.f == g_tuple:
             for var, arg in zip(vars, val.args):
                 yield Eqn([var], arg)
         else:
@@ -504,49 +523,112 @@ def let_to_lambda(e: Expr) -> Expr:
         return Call(Lambda(args, body), vals)
 
 
+def elide_empty_lhs(e: Expr) -> Expr:
+    """
+    let [] = val1, x2 = val2 in body
+    ->
+    let x2 = val2 in body
+    """
+    if e.isLet:
+        return Let(
+            [
+                Eqn(eqn.vars, transform(elide_empty_lhs, eqn.val))
+                for eqn in e.eqns
+                if len(eqn.vars) > 0
+            ],
+            transform(elide_empty_lhs, e.body),
+        )
+
+
 def ex2py(name, ex):
-    filename = "tmp/" + name + ".ex"
+    filename = "tmp/ex-" + name + ".txt"
     with open(filename, "w") as f:
         pprint(ex, stream=f)
 
-    filename = "tmp/" + name + ".py"
+    filename = "tmp/py-" + name + ".py"
     with open(filename, "w") as f:
-        print(astunparse.unparse(to_ast(ex, name)), file=f)
+        print(astunparse.unparse(to_ast(ex, "ret")), file=f)
+
+
+def identify_identities(e: Expr) -> Expr:
+    """
+    lambda x: x -> g_identity
+    """
+    if e.isLambda and [e.body] == e.args:
+        return g_identity
+
+
+def eliminate_identities(e: Expr) -> Expr:
+    """
+    g_identity(args) -> args
+    """
+    if e.isCall and e.f == g_identity:
+        return mkTuple(e.args)
 
 
 def optimize(e: Expr) -> Expr:
     def signature(e):
-        return set.union(freevars(e), {Var("tuple")})
+        """
+        A "signature" is a loose hash.
+        Optimization might change the expression a lot, so the signature
+        should really be the same for two experessions which compute the
+        same quantities, which we know is uncomputable.
 
-    global oex
-    oex = e
+        This just computes the freevars of the expression, which will essentially
+        be the list of external functions called. For trivial optimizations this
+        may be fine, but e.g. DCE or user-level rewrites might result in fewer
+        functions being called...
+        """
+        fvs = {v.name for v in freevars(e)}
+        return set.union(fvs, {g_tuple.name, g_identity.name})
 
-    def check(ex):
-        global oex
-        osig = signature(oex)
-        sig = signature(ex)
+    def run(transformation_name, ex, transformation=None):
+        print(f"Running {transformation_name}")
+        if not transformation:
+            if transformation_name.startswith("t-"):
+                transformation = globals()[transformation_name[2:]]
+                transformation = transform(transformation)
+            else:
+                transformation = globals()[transformation_name]
+
+        new_ex = transformation(ex)
+
+        ex2py(f"{run.count:02d}-{transformation_name}", new_ex)
+        run.count += 1
+
+        osig = signature(ex)
+        sig = signature(new_ex)
         if sig != osig:
-            ex2py("ex0", oex)
-            ex2py("ex1", ex)
             assert False
-        oex = ex
-        # sig = new_sig - if we wanted to keep going
+        return new_ex
 
-    e = uniquify_names(e)
-    check(e)
+    run.count = 1
 
-    e = transform(inline_call_of_lambda, e)
-    check(e)
-    e = transform(inline_trivial_letbody, e)
-    check(e)
-    e = transform(inline_lambda_of_call, e)
-    check(e)
-    e = to_anf(e)
-    check(e)
-    e = transform(detuple_tuple_assignments, e)
-    check(e)
-    e = inline_trivial_assignments(e)
-    check(e)
+    print(f"Starting optimization, {str(signature(e))[:80]}")
+    ex2py(f"00-before-optimization", e)
+    e = run("uniquify_names", e)
+    for t in (
+        elide_empty_lhs,
+        inline_call_of_lambda,
+        inline_trivial_letbody,
+        inline_lambda_of_call,
+        inline_lambda_of_let_of_call,
+        identify_identities,
+        eliminate_identities,
+    ):
+        e = run("t-" + t.__name__, e, transform(t))
+
+    e = run("to_anf", e)
+    e = run("t-detuple_tuple_assignments", e)
+    e = run("inline_trivial_assignments", e)
+
+    for t in (eliminate_identities,):
+        e = run("t-" + t.__name__, e, transform(t))
+
+    e = run("inline_trivial_assignments", e)
+
+    ex2py(f"99-after-optimization", e)
+
     return e
 
 
@@ -560,7 +642,7 @@ def test_let_to_lambda():
     preorder_visit(l, check)
 
 
-def uniquify_names(e: Expr, reset_ids: bool = True) -> Expr:
+def uniquify_names(e: Expr, reset_ids: bool = False) -> Expr:
     if reset_ids:
         reset_new_name_ids()
     # To start with, add freevars to scope, with their own names
@@ -797,7 +879,7 @@ def to_ast_constant(val):
     return ast_expr.value
 
 
-def to_ast_aux(e, assignments):
+def to_ast_aux(e, assignments, binders=None):
     if e.isConst:
         return to_ast_constant(e.val)
 
@@ -810,9 +892,19 @@ def to_ast_aux(e, assignments):
             if len(avars) > 1:
                 avars = [ast.Tuple(avars, ast.Store())]
 
-            aval = to_ast_aux(eqn.val, assignments)
-            assign = ast.Assign(targets=avars, value=aval)
-            assignments += [assign]
+            aval = to_ast_aux(eqn.val, assignments, binders=eqn.vars)
+            # If it was a function definition, it will have emitted
+            # def foo(...):
+            # and returned Name(foo)
+            # so we would be adding an assignment foo = foo
+            elide = (
+                isinstance(aval, ast.Name)
+                and len(eqn.vars) == 1
+                and aval.id == eqn.vars[0].name
+            )
+            if not elide:
+                assign = ast.Assign(targets=avars, value=aval)
+                assignments += [assign]
 
         inner_assignments = []
         abody = to_ast_aux(e.body, inner_assignments)
@@ -823,11 +915,15 @@ def to_ast_aux(e, assignments):
         inner_assignments = []
         abody = to_ast_aux(e.body, inner_assignments)
         inner_assignments += [ast.Return(abody)]
-        name = "f" + get_new_name()
+        if binders is None:
+            v = Var("f" + get_new_name())
+        else:
+            assert len(binders) == 1
+            v = binders[0]
         aargs = to_ast_args(e.args)
-        fdef = to_ast_FunctionDef(name, aargs, inner_assignments)
+        fdef = to_ast_FunctionDef(v.name, aargs, inner_assignments)
         assignments += [fdef]
-        return to_ast_aux(Var(name), None)
+        return to_ast_aux(v, None)
 
     if e.isCall:
         f = to_ast_aux(e.f, assignments)
@@ -934,7 +1030,7 @@ def from_ast(a: ast.AST):
         return Call(func, args)
 
     if isinstance(a, ast.Tuple):
-        return Call(Var("tuple"), [recurse(e) for e in a.elts])
+        return Call(g_tuple, [recurse(e) for e in a.elts])
 
     if isinstance(a, ast.BinOp):
         return Call(recurse(a.op), [recurse(a.left), recurse(a.right)])

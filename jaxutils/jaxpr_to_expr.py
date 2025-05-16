@@ -14,6 +14,7 @@ from jax import lax
 import jax.numpy as jnp
 import jax._src as jaxsrc
 from jax.extend import core as jaxcore
+from jax.extend import linear_util as jaxlu
 
 from pprint import pprint
 
@@ -56,6 +57,26 @@ _prim_to_expr: Dict[jaxcore.Primitive, Callable[..., Optional[Expr]]] = {}
 
 
 def declare_prim_to_expr(prim):
+    """
+    Decorator to register a function as a primitive-to-expression translator.
+
+    Behaviour: the prim_translator can return a new Expr, or None
+    If None, we will simply call prim.bind(*args, **kwargs)
+
+    It is called as
+      prim_translator(*args, **kwargs)
+    where the args are Exprs.  An example might be (if matmul were a prim)
+
+      @declare_prim_to_expr(matmul_p)
+      def _(a, b):
+        return new_call("matmul", a, b)
+
+    This is trivial, changing the rendering from
+        matmul_p.bind(a, b)
+    to
+        matmul(a, b)
+    but the design allows for more complex transformations.
+    """
     return dictassign(_prim_to_expr, prim)
 
 
@@ -77,7 +98,7 @@ def _(val, dimensions=None):
 
 @declare_prim_to_expr(lax.slice_p)
 def _(val, start_indices=None, limit_indices=None, strides=None):
-    if all(v == 1 for v in strides.val):
+    if not strides or not strides.val or all(v == 1 for v in strides.val):
         return new_call("slice", val, start_indices, limit_indices)
     else:
         return new_call("slice", val, start_indices, limit_indices, strides=strides)
@@ -108,10 +129,13 @@ def _(
         dimension_numbers,
         precision=precision,
         preferred_element_type=preferred_element_type,
+        out_sharding=out_sharding,
     )
 
 
 translate_pjit_passthru = True
+global pjit_name_count
+pjit_name_count = 0
 
 
 def unspecified(xs):
@@ -138,10 +162,17 @@ def _(
     # Elide the call if the shardings are unspecified
     if (
         translate_pjit_passthru
+        and not name
         and unspecified(in_shardings.val)
         and unspecified(out_shardings.val)
     ):
         return Call(jaxpr, list(args))
+
+    if name:
+        global pjit_name_count
+        f = Var(f"pjit_{name.val}_{pjit_name_count}")
+        pjit_name_count += 1
+        return Let([Eqn([f], jaxpr)], Call(f, list(args)))
 
 
 @declare_prim_to_expr(jax.lax.scatter_add_p)
@@ -274,7 +305,7 @@ def jaxpr_to_expr_aux(x) -> Expr:
         # return Var(f"v_{x.count+11}{x.suffix}")
         return Var(varname(x))
 
-    if isinstance(x, types.FunctionType):
+    if isinstance(x, (types.FunctionType, jaxlu.WrappedFun)):
         return Const(str(x))
 
     # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
