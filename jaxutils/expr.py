@@ -2,7 +2,7 @@ import sys
 import enum
 from dataclasses import dataclass
 from beartype import beartype
-from beartype.typing import List, Set, Any, Tuple, Dict, List, Callable
+from beartype.typing import List, Set, Any, Tuple, Dict, List, Callable, Optional
 from pprint import pprint
 from itertools import chain
 
@@ -101,6 +101,24 @@ def reset_new_name_ids():
 ## Declare Expr classes
 
 
+######################################################################################
+#
+#
+#
+#    oooooooooooo
+#    `888'     `8
+#     888         oooo    ooo oo.ooooo.  oooo d8b
+#     888oooo8     `88b..8P'   888' `88b `888""8P
+#     888    "       Y888'     888   888  888
+#     888       o  .o8"'88b    888   888  888
+#    o888ooooood8 o88'   888o  888bod8P' d888b
+#                              888
+#                             o888o
+#
+#
+######################################################################################
+
+
 @beartype
 class Expr:
     """
@@ -195,11 +213,16 @@ def mkvars(s: str) -> Tuple[Var]:
     return [Var(s) for s in s.split(",")]
 
 
-def transform(transformer: Callable[[Expr], Expr], e: Expr = None):
-    if e is None:
-        return lambda e: transform(transformer, e)
+def isNone(x: Optional[Expr]) -> bool:
+    return x is None or x.isConst and x.val is None
 
-    recurse = lambda e: transform(transformer, e)
+
+def transform_postorder(transformer: Callable[[Expr], Expr], e: Expr = None):
+    if e is None:
+        # Make transform(transformer)(e) work like transform(transformer, e)
+        return lambda e: transform_postorder(transformer, e)
+
+    recurse = lambda e: transform_postorder(transformer, e)
 
     # Recurse into children
     if e.isLet:
@@ -321,7 +344,19 @@ def mkTuple(es: List[Expr]) -> Expr:
         return Call(g_tuple, es)
 
 
-### Optimizations
+#####################################################################################
+#
+#   .oooooo.                  .    o8o                     o8o
+#  d8P'  `Y8b               .o8    `"'                     `"'
+# 888      888 oo.ooooo.  .o888oo oooo  ooo. .oo.  .oo.   oooo    oooooooo  .ooooo.
+# 888      888  888' `88b   888   `888  `888P"Y88bP"Y88b  `888   d'""7d8P  d88' `88b
+# 888      888  888   888   888    888   888   888   888   888     .d8P'   888ooo888
+# `88b    d88'  888   888   888 .  888   888   888   888   888   .d8P'  .P 888    .o
+#  `Y8bood8P'   888bod8P'   "888" o888o o888o o888o o888o o888o d8888888P  `Y8bod8P'
+#               888
+#              o888o
+#
+#####################################################################################
 
 
 def inline_call_of_lambda(e: Expr) -> Expr:
@@ -516,10 +551,10 @@ def let_to_lambda(e: Expr) -> Expr:
             assert len(eqn.vars) == 1, "Use detuple_lets before let_to_lambda"
             args += eqn.vars
 
-            val = transform(let_to_lambda, eqn.val)
+            val = transform_postorder(let_to_lambda, eqn.val)
             vals += [val]
 
-        body = transform(let_to_lambda, e.body)
+        body = transform_postorder(let_to_lambda, e.body)
         return Call(Lambda(args, body), vals)
 
 
@@ -532,11 +567,11 @@ def elide_empty_lhs(e: Expr) -> Expr:
     if e.isLet:
         return Let(
             [
-                Eqn(eqn.vars, transform(elide_empty_lhs, eqn.val))
+                Eqn(eqn.vars, transform_postorder(elide_empty_lhs, eqn.val))
                 for eqn in e.eqns
                 if len(eqn.vars) > 0
             ],
-            transform(elide_empty_lhs, e.body),
+            transform_postorder(elide_empty_lhs, e.body),
         )
 
 
@@ -587,7 +622,7 @@ def optimize(e: Expr) -> Expr:
         if not transformation:
             if transformation_name.startswith("t-"):
                 transformation = globals()[transformation_name[2:]]
-                transformation = transform(transformation)
+                transformation = transform_postorder(transformation)
             else:
                 transformation = globals()[transformation_name]
 
@@ -616,14 +651,14 @@ def optimize(e: Expr) -> Expr:
         identify_identities,
         eliminate_identities,
     ):
-        e = run("t-" + t.__name__, e, transform(t))
+        e = run("t-" + t.__name__, e, transform_postorder(t))
 
     e = run("to_anf", e)
     e = run("t-detuple_tuple_assignments", e)
     e = run("inline_trivial_assignments", e)
 
     for t in (eliminate_identities,):
-        e = run("t-" + t.__name__, e, transform(t))
+        e = run("t-" + t.__name__, e, transform_postorder(t))
 
     e = run("inline_trivial_assignments", e)
 
@@ -634,7 +669,7 @@ def optimize(e: Expr) -> Expr:
 
 def test_let_to_lambda():
     e = _make_e()
-    l = transform(let_to_lambda, e)
+    l = transform_postorder(let_to_lambda, e)
 
     def check(e):
         assert not e.isLet
@@ -740,7 +775,17 @@ def test_uniquify_names():
     assert out.body.eqns[0].vars[0] != out.eqns[0].vars[0]
 
 
-######### Eval
+######################################################################################
+#
+#    oooooooooooo                       oooo
+#    `888'     `8                       `888
+#     888         oooo    ooo  .oooo.    888
+#     888oooo8     `88.  .8'  `P  )88b   888
+#     888    "      `88..8'    .oP"888   888
+#     888       o    `888'    d8(  888   888
+#    o888ooooood8     `8'     `Y888""8o o888o
+#
+######################################################################################
 
 
 def run_eval(e: Expr, bindings: Dict[str, Any]) -> Any:
@@ -835,6 +880,19 @@ def test_eval():
 
 
 ######### To AST
+
+######################################################################################
+#
+#          .o.        .oooooo..o ooooooooooooo
+#        .888.      d8P'    `Y8 8'   888   `8
+#        .8"888.     Y88bo.           888
+#      .8' `888.     `"Y8888o.       888
+#      .88ooo8888.        `"Y88b      888
+#    .8'     `888.  oo     .d8P      888
+#    o88o     o8888o 8""88888P'      o888o
+#
+#
+######################################################################################
 
 
 def to_ast_FunctionDef(name, args, body):
@@ -1128,3 +1186,16 @@ def expr_to_python_code(e: Expr, name: str) -> str:
 
 def eval_expr(e: Expr, args, bindings):
     return run_eval(Call(e, [Const(a) for a in args]), bindings)
+
+
+######################################################################################
+#
+#
+#
+#
+#
+#
+#
+#
+#
+######################################################################################
