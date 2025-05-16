@@ -18,7 +18,7 @@ from jax.extend import core as jaxcore
 from pprint import pprint
 
 import jaxutils
-from jaxutils.expr import Expr, Var, Const, Lambda, Let, Call, mkTuple
+from jaxutils.expr import Expr, Var, Const, Lambda, Eqn, Let, Call, mkTuple
 
 from jaxutils.expr import (
     dictassign,
@@ -52,26 +52,30 @@ def new_call(fn: str, *args, **kwargs):
     return Call(Var(fn), list(args) + kwargs_to_dict_call(kwargs))
 
 
-translators: Dict[jaxcore.Primitive, Callable[..., Optional[Expr]]] = {}
+_prim_to_expr: Dict[jaxcore.Primitive, Callable[..., Optional[Expr]]] = {}
 
 
-@dictassign(translators, lax.convert_element_type_p)
+def declare_prim_to_expr(prim):
+    return dictassign(_prim_to_expr, prim)
+
+
+@declare_prim_to_expr(lax.convert_element_type_p)
 def _(val, new_dtype=None, weak_type=False, sharding=None):
     if weak_type.val == False:
         return new_call("convert_element_type", val, new_dtype)
 
 
-@dictassign(translators, lax.broadcast_in_dim_p)
+@declare_prim_to_expr(lax.broadcast_in_dim_p)
 def _(val, shape=None, broadcast_dimensions=None, sharding=None):
     return new_call("broadcast_in_dim", val, shape, broadcast_dimensions)
 
 
-@dictassign(translators, lax.squeeze_p)
+@declare_prim_to_expr(lax.squeeze_p)
 def _(val, dimensions=None):
     return new_call("squeeze", val, dimensions)
 
 
-@dictassign(translators, lax.slice_p)
+@declare_prim_to_expr(lax.slice_p)
 def _(val, start_indices=None, limit_indices=None, strides=None):
     if all(v == 1 for v in strides.val):
         return new_call("slice", val, start_indices, limit_indices)
@@ -79,7 +83,7 @@ def _(val, start_indices=None, limit_indices=None, strides=None):
         return new_call("slice", val, start_indices, limit_indices, strides=strides)
 
 
-@dictassign(translators, lax.dot_general_p)
+@declare_prim_to_expr(lax.dot_general_p)
 def _(
     a,
     b,
@@ -115,7 +119,7 @@ def unspecified(xs):
     return jax.tree.all(jax.tree.map(is_unspec, xs))
 
 
-@dictassign(translators, jaxsrc.pjit.pjit_p)
+@declare_prim_to_expr(jaxsrc.pjit.pjit_p)
 def _(
     *args,
     jaxpr=None,
@@ -140,7 +144,7 @@ def _(
         return Call(jaxpr, list(args))
 
 
-@dictassign(translators, jax.lax.scatter_add_p)
+@declare_prim_to_expr(jax.lax.scatter_add_p)
 def _(*args, **kwargs):
     #    v_35 = scatter_add(
     #         v_34,
@@ -200,27 +204,29 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
     """
 
     # Will return Lambda(args, body)
-    body = mkTuple([jaxpr_to_expr_aux(v) for v in jaxpr.outvars])
+    args = [jaxpr_to_expr_aux(v) for v in jaxpr.invars]
 
-    for cv in reversed(jaxpr.constvars):
-        body = Let([jaxpr_to_expr_aux(cv)], Const(cv.aval), body)
+    # Eqns for constvars
+    new_eqns = [Eqn([jaxpr_to_expr_aux(cv)], Const(cv.aval)) for cv in jaxpr.constvars]
 
-    for eqn in reversed(jaxpr.eqns):
+    # And eqns for eqns
+    for eqn in jaxpr.eqns:
         new_params = {key: jaxpr_to_expr_aux(val) for key, val in eqn.params.items()}
-        args = [jaxpr_to_expr_aux(v) for v in eqn.invars]
+        eqn_args = [jaxpr_to_expr_aux(v) for v in eqn.invars]
 
         val = None
-        if eqn.primitive in translators:
-            val = translators[eqn.primitive](*args, **new_params)
+        if eqn.primitive in _prim_to_expr:
+            val = _prim_to_expr[eqn.primitive](*eqn_args, **new_params)
 
         if val is None:
             params = kwargs_to_dict_call(new_params)
-            val = Call(Var(eqn.primitive.name + "_p.bind"), args + params)
+            val = Call(Var(eqn.primitive.name + "_p.bind"), eqn_args + params)
 
         vars = map(jaxpr_to_expr_aux, eqn.outvars)
-        body = Let([*vars], val, body)
+        new_eqns += [Eqn([*vars], val)]
 
-    args = [jaxpr_to_expr_aux(v) for v in jaxpr.invars]
+    body = Let(new_eqns, mkTuple([jaxpr_to_expr_aux(v) for v in jaxpr.outvars]))
+
     return Lambda(args, body)
 
 
@@ -514,7 +520,7 @@ def test_roundtrip(n):
     print(f(*args))
 
     def save(f, args, name, fn):
-        jaxutils.expr._global_name_id = 0
+        jaxutils.expr.reset_new_name_ids()
 
         with open(fn, "w") as file:
             show_jaxpr(f, args, name=name, file=file, add_decls=True)

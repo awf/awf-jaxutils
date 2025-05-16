@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from beartype import beartype
 from beartype.typing import List, Set, Any, Tuple, Dict, List, Callable
 from pprint import pprint
+from itertools import chain
 
 import ast
 
@@ -83,13 +84,18 @@ test_all_equal()
 
 ### New name factory
 
-_global_name_id = 0
+_expr_global_name_id = 0
 
 
 def get_new_name():
-    global _global_name_id
-    _global_name_id += 1
-    return f"{_global_name_id:02d}"
+    global _expr_global_name_id
+    _expr_global_name_id += 1
+    return f"{_expr_global_name_id:02d}"
+
+
+def reset_new_name_ids():
+    global _expr_global_name_id
+    _expr_global_name_id = 0
 
 
 ## Declare Expr classes
@@ -104,7 +110,7 @@ class Expr:
 
         Const:   Constant
         Var:     Variable name
-        Let:     Let vars = val in Expr
+        Let:     Let (vars1 = val1, ..., varsN = valsN) in Expr
         Lambda:  Lambda vars . body
         Call:    Call (func: Expr) (args : List[Expr])
 
@@ -156,9 +162,14 @@ class Var(Expr):
 
 
 @exprclass
-class Let(Expr):
+class Eqn:
     vars: List[Var]
     val: Expr
+
+
+@exprclass
+class Let(Expr):
+    eqns: List[Eqn]
     body: Expr
 
 
@@ -189,9 +200,9 @@ def transform(transformer: Callable[[Expr], Expr], e: Expr):
 
     # Recurse into children
     if e.isLet:
-        new_val = recurse(e.val)
+        new_eqns = [Eqn(eqn.vars, recurse(eqn.val)) for eqn in e.eqns]
         new_body = recurse(e.body)
-        e = Let(e.vars, new_val, new_body)
+        e = Let(new_eqns, new_body)
 
     if e.isLambda:
         e = Lambda(e.args, recurse(e.body))
@@ -213,9 +224,13 @@ def freevars(e: Expr) -> Set[Var]:
         return {e}
 
     if e.isLet:
-        fv_body = set.difference(freevars(e.body), set(e.vars))
-        fv_val = freevars(e.val)
-        return set.union(fv_val, fv_body)
+        bound_vars = set()
+        fv_vals = set()
+        for eqn in e.eqns:
+            fv_vals |= set.difference(freevars(eqn.val), bound_vars)
+            bound_vars = set.union(bound_vars, set(eqn.vars))
+        fv_body = set.difference(freevars(e.body), bound_vars)
+        return set.union(fv_vals, fv_body)
 
     if e.isLambda:
         return set.difference(freevars(e.body), e.args)
@@ -231,15 +246,27 @@ def _make_e():
     import math
     import operator
 
-    foo, x, y, z = mkvars("foo, x, y, z")
+    foo, w, x, y, z = mkvars("foo, w, x, y, z")
     v_sin, v_add, v_mul = mkvars("sin, add, mul")
 
     a_lam = Lambda([z], Call(v_sin, [z]))
     call_lam = Call(a_lam, [x])
     foo_lam = Lambda(
-        [x, y], Let([z], Call(v_add, [x, Const(3.3)]), Call(v_mul, [call_lam, y]))
+        [x, y],
+        Let(
+            [
+                Eqn([w], Call(v_add, [x, Const(3.3)])),
+                Eqn([z], Call(v_add, [x, w])),
+            ],
+            Call(v_mul, [call_lam, y]),
+        ),
     )
-    e = Let([foo], foo_lam, Call(foo, [Const(1.1), Const(2.2)]))
+    e = Let(
+        [
+            Eqn([foo], foo_lam),
+        ],
+        Call(foo, [Const(1.1), Const(2.2)]),
+    )
     return e
 
 
@@ -251,31 +278,32 @@ def test_basic():
 
     pprint(e)
     assert freevars(e) == {v_sin, v_add, v_mul}
-    assert freevars(e.val) == {v_sin, v_add, v_mul}
-    assert freevars(e.val.body) == {x, y, v_sin, v_add, v_mul}
+    assert freevars(e.eqns[0].val) == {v_sin, v_add, v_mul}
+    assert freevars(e.eqns[0].val.body) == {x, y, v_sin, v_add, v_mul}
 
 
-def visit(e: Expr, f: Callable[[Expr], Any]):
+def preorder_visit(e: Expr, f: Callable[[Expr], Any]):
     # Call f on e
     f(e)
 
-    # And recurse into children
+    # And recurse into Expr children
     if e.isLet:
-        visit(e.val, f)
-        visit(e.body, f)
+        for eqn in e.eqns:
+            preorder_visit(eqn.val, f)
+        preorder_visit(e.body, f)
 
     if e.isLambda:
-        visit(e.body, f)
+        preorder_visit(e.body, f)
 
     if e.isCall:
-        visit(e.f, f)
+        preorder_visit(e.f, f)
         for arg in e.args:
-            visit(arg, f)
+            preorder_visit(arg, f)
 
 
 def test_visit():
     e = _make_e()
-    visit(e, lambda x: print(type(x)))
+    preorder_visit(e, lambda x: print(type(x)))
 
 
 def mkTuple(es: List[Expr]) -> Expr:
@@ -293,14 +321,14 @@ def inline_call_of_lambda(e: Expr) -> Expr:
     #  ->  let l_args = args in body
     # Name clashes will happen unless all bound var names were uniquified
     if e.isCall and e.f.isLambda:
-        return Let(e.f.args, mkTuple(e.args), e.f.body)
+        return Let([Eqn(e.f.args, mkTuple(e.args))], e.f.body)
 
 
 def inline_trivial_letbody(e: Expr) -> Expr:
     # let var = val in var -> val
-    if e.isLet and len(e.vars) == 1:
-        if e.vars == [e.body]:
-            return e.val
+    if e.isLet and len(e.eqns) == 1 and len(e.eqns[0].vars) == 1:
+        if e.eqns[0].vars[0] == e.body:
+            return e.eqns[0].val
 
 
 def inline_lambda_of_call(e: Expr) -> Expr:
@@ -312,28 +340,33 @@ def inline_lambda_of_call(e: Expr) -> Expr:
 
 
 def detuple_tuple_assignments(e: Expr) -> Expr:
-    # Let([a, b, c], Call(tuple, [aprime, bprime, cprime]),
+    # Let([Eqn([a, b, c], Call(tuple, [aprime, bprime, cprime]))],
     #       body) ->
-    #  Let([a], aprime,
-    #    Let([b], bprime,
-    #      Let([c], cprime,
+    #  Let([Eqn(a, aprime),
+    #       Eqn(b, bprime),
+    #       Eqn(c, cprime)],
     #           body)))
-    if e.isLet and len(e.vars) > 1:
-        if e.val.isCall and e.val.f == Var("tuple"):
-            new_body = e.body
-            for lhs, rhs in reversed(tuple(zip(e.vars, e.val.args))):
-                new_body = Let([lhs], rhs, new_body)
-            return new_body
+    if not e.isLet:
+        return e
+
+    def detuple_eqn(eqn):
+        vars = eqn.vars
+        val = eqn.val
+        if len(vars) > 1 and val.isCall and val.f == Var("tuple"):
+            for var, arg in zip(vars, val.args):
+                yield Eqn([var], arg)
+        else:
+            yield Eqn(vars, val)
+
+    new_eqns = list(chain(*map(detuple_eqn, e.eqns)))
+    return Let(new_eqns, e.body)
 
 
 def to_anf(e):
     e = uniquify_names(e)
     assignments = []
     expr = to_anf_aux(e, assignments)
-    # now rip through assignments, making Lets
-    for vars, val in reversed(assignments):
-        expr = Let(vars, val, expr)
-    return expr
+    return Let(assignments, expr)
 
 
 def to_anf_aux(e, assignments):
@@ -341,12 +374,10 @@ def to_anf_aux(e, assignments):
         return e
 
     if e.isLet:
-        new_val = to_anf_aux(e.val, assignments)
-        inner_assignments = []
-        abody = to_anf_aux(e.body, inner_assignments)
-        assign = (e.vars, new_val)
-        assignments += [assign]
-        assignments += inner_assignments
+        for eqn in e.eqns:
+            new_val = to_anf_aux(eqn.val, assignments)
+            assignments += [Eqn(eqn.vars, new_val)]
+        abody = to_anf_aux(e.body, assignments)
         return abody
 
     if e.isLambda:
@@ -360,25 +391,24 @@ def to_anf_aux(e, assignments):
     assert False
 
 
-def is_trivial(e: Expr):
-    if e.isVar:
-        return True
-
-    if e.isConst and isinstance(e.val, (float, str, int)):
-        return True
-
-    return False
-
-
 def inline_trivial_assignments(e):
     return inline_trivial_assignments_aux(e, {})
 
 
 @beartype
 def inline_trivial_assignments_aux(e: Expr, translations: Dict[Var, Expr]):
-    # let a = b in body -> body[a->b]
+    # let a = b in body -> body[a->b] if b is trivial
 
     recurse = inline_trivial_assignments_aux
+
+    def is_trivial(e: Expr):
+        if e.isVar:
+            return True
+
+        if e.isConst and isinstance(e.val, (float, str, int)):
+            return True
+
+        return False
 
     if e.isConst:
         return e
@@ -387,22 +417,31 @@ def inline_trivial_assignments_aux(e: Expr, translations: Dict[Var, Expr]):
         return translations.get(e, e)
 
     if e.isLet:
-        new_val = recurse(e.val, translations)
-
-        # Remove our vars from translations
-        argset = set(e.vars)
-        new_translations = {
-            var: val for (var, val) in translations.items() if var not in argset
-        }
-        assert all(v not in new_translations for v in e.vars)
 
         # let vars = val in body
-        if len(e.vars) == 1 and is_trivial(new_val):
-            new_translations[e.vars[0]] = new_val
-            return recurse(e.body, new_translations)
+        new_eqns = []
+
+        inner_translations = {**translations}
+
+        for eqn in e.eqns:
+            vars = eqn.vars
+            new_val = recurse(eqn.val, inner_translations)
+            if len(vars) == 1 and is_trivial(new_val):
+                # Add val to translations, and don't add it to our new eqns
+                inner_translations[vars[0]] = new_val
+            else:
+                # keep val, and delete newly bound vars from translations
+                new_eqns += [Eqn(vars, new_val)]
+                for var in vars:
+                    if var in inner_translations:
+                        del inner_translations[var]
+
+        new_body = recurse(e.body, inner_translations)
+
+        if len(new_eqns):
+            return Let(new_eqns, new_body)
         else:
-            new_body = recurse(e.body, new_translations)
-            return Let(e.vars, new_val, new_body)
+            return new_body
 
     if e.isLambda:
         argset = set(e.args)
@@ -423,7 +462,22 @@ def inline_trivial_assignments_aux(e: Expr, translations: Dict[Var, Expr]):
 
 def test_inline_trivial_assignments():
     a, b, c, d = mkvars("a,b,c,d")
-    e = Let([a], b, Call(a, [Let([a], c, Call(a, [a, b, c]))]))
+    e = Let(
+        [
+            Eqn([a], b),
+        ],
+        Call(
+            a,
+            [
+                Let(
+                    [
+                        Eqn([a], c),
+                    ],
+                    Call(a, [a, b, c]),
+                )
+            ],
+        ),
+    )
     out = inline_trivial_assignments(e)
     pprint(out)
     expect = Call(b, [Call(c, [c, b, c])])
@@ -432,27 +486,50 @@ def test_inline_trivial_assignments():
 
 def let_to_lambda(e: Expr) -> Expr:
     """
-    let x = val in body
+    let x1 = val1, x2 = val2 in body
     ->
-    call(lambda x: body, val)
+    call(lambda x1,x2: body, (val1, val2))
     """
     if e.isLet:
-        val = transform(let_to_lambda, e.val)
+        args = []
+        vals = []
+        for eqn in e.eqns:
+            assert len(eqn.vars) == 1, "Use detuple_lets before let_to_lambda"
+            args += eqn.vars
+
+            val = transform(let_to_lambda, eqn.val)
+            vals += [val]
+
         body = transform(let_to_lambda, e.body)
-        return Call(Lambda(e.vars, body), [val])
+        return Call(Lambda(args, body), vals)
+
+
+def ex2py(name, ex):
+    filename = "tmp/" + name + ".ex"
+    with open(filename, "w") as f:
+        pprint(ex, stream=f)
+
+    filename = "tmp/" + name + ".py"
+    with open(filename, "w") as f:
+        print(astunparse.unparse(to_ast(ex, name)), file=f)
 
 
 def optimize(e: Expr) -> Expr:
     def signature(e):
         return set.union(freevars(e), {Var("tuple")})
 
-    global sig
-    sig = signature(e)
+    global oex
+    oex = e
 
     def check(ex):
-        global sig
-        new_sig = signature(ex)
-        assert sig == new_sig
+        global oex
+        osig = signature(oex)
+        sig = signature(ex)
+        if sig != osig:
+            ex2py("ex0", oex)
+            ex2py("ex1", ex)
+            assert False
+        oex = ex
         # sig = new_sig - if we wanted to keep going
 
     e = uniquify_names(e)
@@ -480,10 +557,13 @@ def test_let_to_lambda():
     def check(e):
         assert not e.isLet
 
-    visit(l, check)
+    preorder_visit(l, check)
 
 
-def uniquify_names(e: Expr):
+def uniquify_names(e: Expr, reset_ids: bool = True) -> Expr:
+    if reset_ids:
+        reset_new_name_ids()
+    # To start with, add freevars to scope, with their own names
     translations = {v.name: v.name for v in freevars(e)}
     return uniquify_names_aux(e, translations)
 
@@ -501,7 +581,8 @@ def uniquify_names_aux(e: Expr, translations) -> Expr:
         return e
 
     if e.isVar:
-        return Var(translations.get(e.name, e.name))
+        assert e.name in translations
+        return Var(translations[e.name])
 
     if e.isCall:
         return Call(
@@ -509,47 +590,72 @@ def uniquify_names_aux(e: Expr, translations) -> Expr:
             [uniquify_names_aux(arg, translations) for arg in e.args],
         )
 
-    assert e.isLet or e.isLambda
-
-    if e.isLet:
-        vars = e.vars
     if e.isLambda:
         vars = e.args
 
-    new_translations = {**translations}
-    new_vars = []
-    for var in [var.name for var in vars]:
-        # This var has just come in scope.
-        # If its name is already in translations, it is clashing,
-        # so in the body of this let, it will need a new name
-        if var in new_translations:
-            newname = "t_" + get_new_name()
-        else:
-            newname = var
-        new_translations[var] = newname
-        new_vars.append(Var(newname))
+        new_translations = {**translations}  # TODO-Q
+        new_vars = []
+        for varname in [var.name for var in vars]:
+            # This var has just come in scope.
+            # If its name is already in translations, it is clashing,
+            # so in the body of this lambda, it will need a new new name
+            if varname in new_translations:
+                newname = "t_" + get_new_name()
+            else:
+                newname = varname
+            new_translations[varname] = newname
+            new_vars.append(Var(newname))
 
-    if e.isLet:
-        new_val = uniquify_names_aux(e.val, translations)
-        new_body = uniquify_names_aux(e.body, new_translations)
-        return Let(new_vars, new_val, new_body)
-
-    if e.isLambda:
         new_body = uniquify_names_aux(e.body, new_translations)
         return Lambda(new_vars, new_body)
+
+    if e.isLet:
+        new_translations = {**translations}
+        new_eqns = []
+        for eqn in e.eqns:
+            # First recurse into val using new_translations so far
+            newval = uniquify_names_aux(eqn.val, new_translations)
+            # Now add the new vars to the translation table
+            new_vars = []
+            for var in eqn.vars:
+                # This var has just come in scope.
+                # If its name is already in translations, it is clashing,
+                # so in the body of this let, it will need a new name
+                if var.name in new_translations:
+                    newname = "t_" + get_new_name()
+                else:
+                    newname = var.name
+                new_translations[var.name] = newname
+                new_vars += [Var(newname)]
+            new_eqns += [Eqn(new_vars, newval)]
+
+        new_body = uniquify_names_aux(e.body, new_translations)
+        return Let(new_eqns, new_body)
+
+    assert False  # unreachable
 
 
 def test_uniquify_names():
     a, b, c, d = mkvars("a,b,c,d")
 
-    e = Let([a], a, Let([a], b, Call(b, [a, b])))
+    e = Let(
+        [
+            Eqn([a], a),
+        ],
+        Let(
+            [
+                Eqn([a], b),
+            ],
+            Call(b, [a, b]),
+        ),
+    )
     pprint(e)
     out = uniquify_names(e)
     pprint(out)
-    assert out.vars[0] != a
-    assert out.val == a
-    assert out.body.vars[0] != a
-    assert out.body.vars[0] != out.vars[0]
+    assert out.eqns[0].vars[0] != a
+    assert out.eqns[0].val == a
+    assert out.body.eqns[0].vars[0] != a
+    assert out.body.eqns[0].vars[0] != out.eqns[0].vars[0]
 
 
 ######### Eval
@@ -572,6 +678,8 @@ def run_eval_aux(e: Expr, bindings: Dict[Var, Any]) -> Any:
         return e.val
 
     if e.isVar:
+        if e not in bindings:
+            raise ValueError(f"Unbound variable {e.name}")
         return bindings[e]
 
     if e.isCall:
@@ -581,20 +689,23 @@ def run_eval_aux(e: Expr, bindings: Dict[Var, Any]) -> Any:
         return new_f(*new_args)
 
     if e.isLet:
-        # let vars = val in body
-        argset = set(e.vars)
-        new_bindings = {
-            var: val for (var, val) in bindings.items() if var not in argset
-        }
+        # let
+        #   vars1 = val1 [fvs x]
+        #   vars2 = val2 [fvs x vars1]
+        # in
+        #   body
+        argset = set()
+        new_bindings = {**bindings}
+        for eqn in e.eqns:
+            tupval = recurse(eqn.val, new_bindings)
 
-        tupval = recurse(e.val, bindings)
-        if len(e.vars) > 1:
-            assert isinstance(tupval, tuple)
-        else:
-            tupval = (tupval,)
+            if len(eqn.vars) > 1:
+                assert isinstance(tupval, tuple)
+            else:
+                tupval = (tupval,)
 
-        for var, val in zip(e.vars, tupval):
-            new_bindings[var] = val
+            for var, val in zip(eqn.vars, tupval):
+                new_bindings[var] = val
 
         return recurse(e.body, new_bindings)
 
@@ -630,7 +741,13 @@ def test_eval():
     assert v == 5
 
     v = run_eval(
-        Let([a, b], Call(f_tuple, [Const(2), Const(3)]), Call(f_add, [a, b])), f_defs
+        Let(
+            [
+                Eqn([a, b], Call(f_tuple, [Const(2), Const(3)])),
+            ],
+            Call(f_add, [a, b]),
+        ),
+        f_defs,
     )
     assert v == 5
 
@@ -688,15 +805,17 @@ def to_ast_aux(e, assignments):
         return ast.Name(e.name, ast.Load())
 
     if e.isLet:
-        avars = [ast.Name(var.name, ast.Store()) for var in e.vars]
-        if len(avars) > 1:
-            avars = [ast.Tuple(avars, ast.Store())]
+        for eqn in e.eqns:
+            avars = [ast.Name(var.name, ast.Store()) for var in eqn.vars]
+            if len(avars) > 1:
+                avars = [ast.Tuple(avars, ast.Store())]
 
-        aval = to_ast_aux(e.val, assignments)
+            aval = to_ast_aux(eqn.val, assignments)
+            assign = ast.Assign(targets=avars, value=aval)
+            assignments += [assign]
+
         inner_assignments = []
         abody = to_ast_aux(e.body, inner_assignments)
-        assign = ast.Assign(targets=avars, value=aval)
-        assignments += [assign]
         assignments += inner_assignments
         return abody
 
@@ -719,8 +838,14 @@ def to_ast_aux(e, assignments):
 
 
 def test_ast():
-    a, b = mkvars("a,b")
-    e = Let([a, b], Const(123), Const(234))
+    a, b, c = mkvars("a,b, c")
+    e = Let(
+        [
+            Eqn([a, b], Const(123)),
+            Eqn([c], Call(Var("add"), [a, b])),
+        ],
+        Const(234),
+    )
     pprint(e)
     a = to_ast(e, "e")
     print(astunparse.unparse(a))
@@ -758,10 +883,8 @@ def from_ast(a: ast.AST):
         name = Var(a.name)
         args = recurse(a.args)
 
-        assert isinstance(a.body[-1], ast.Return)
-        body = recurse(a.body[-1].value)
-
-        for stmt in reversed(a.body[:-1]):
+        eqns = []
+        for stmt in a.body[:-1]:
             assert isinstance(stmt, ast.Assign)
             assert len(stmt.targets) == 1
             s_vars = stmt.targets[0]
@@ -770,9 +893,15 @@ def from_ast(a: ast.AST):
             else:
                 vars = [Var(s_vars.id)]
             val = recurse(stmt.value)
-            body = Let(vars, val, body)
+            eqns += [Eqn(vars, val)]
 
-        return Let([name], Lambda(args, body), name)
+        assert isinstance(a.body[-1], ast.Return)
+        retval = recurse(a.body[-1].value)
+
+        body = Let(eqns, retval)
+        lam = Lambda(args, body)
+
+        return Let([Eqn([name], lam)], name)
 
     if isinstance(a, ast.Lambda):
         return Lambda(recurse(a.args), recurse(a.body))
