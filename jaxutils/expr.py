@@ -5,6 +5,7 @@ from beartype import beartype
 from beartype.typing import List, Set, Any, Tuple, Dict, List, Callable, Optional
 from pprint import pprint
 from itertools import chain
+import operator
 
 import ast
 
@@ -101,23 +102,20 @@ def reset_new_name_ids():
 ## Declare Expr classes
 
 
-######################################################################################
+########################################################################################
 #
 #
-#
-#    oooooooooooo
-#    `888'     `8
-#     888         oooo    ooo oo.ooooo.  oooo d8b
-#     888oooo8     `88b..8P'   888' `88b `888""8P
-#     888    "       Y888'     888   888  888
-#     888       o  .o8"'88b    888   888  888
-#    o888ooooood8 o88'   888o  888bod8P' d888b
-#                              888
-#                             o888o
-#
-#
-######################################################################################
-
+#   88888888888
+#   88
+#   88
+#   88aaaaa     8b,     ,d8 8b,dPPYba,  8b,dPPYba,
+#   88"""""      `Y8, ,8P'  88P'    "8a 88P'   "Y8
+#   88             )888(    88       d8 88
+#   88           ,d8" "8b,  88b,   ,a8" 88
+#   88888888888 8P'     `Y8 88`YbbdP"'  88
+#                           88
+#                           88
+########################################################################################
 
 @beartype
 class Expr:
@@ -270,7 +268,6 @@ def freevars(e: Expr) -> Set[Var]:
 def _make_e():
     # Make an expr for testing
     import math
-    import operator
 
     foo, w, x, y, z = mkvars("foo, w, x, y, z")
     v_sin, v_add, v_mul = mkvars("sin, add, mul")
@@ -344,19 +341,87 @@ def mkTuple(es: List[Expr]) -> Expr:
         return Call(g_tuple, es)
 
 
-#####################################################################################
+########################################################################################
 #
-#   .oooooo.                  .    o8o                     o8o
-#  d8P'  `Y8b               .o8    `"'                     `"'
-# 888      888 oo.ooooo.  .o888oo oooo  ooo. .oo.  .oo.   oooo    oooooooo  .ooooo.
-# 888      888  888' `88b   888   `888  `888P"Y88bP"Y88b  `888   d'""7d8P  d88' `88b
-# 888      888  888   888   888    888   888   888   888   888     .d8P'   888ooo888
-# `88b    d88'  888   888   888 .  888   888   888   888   888   .d8P'  .P 888    .o
-#  `Y8bood8P'   888bod8P'   "888" o888o o888o o888o o888o o888o d8888888P  `Y8bod8P'
-#               888
-#              o888o
 #
-#####################################################################################
+#     ,ad8888ba,                      88                    88
+#    d8"'    `"8b               ,d    ""                    ""
+#   d8'        `8b              88
+#   88          88 8b,dPPYba, MM88MMM 88 88,dPYba,,adPYba,  88 888888888  ,adPPYba,
+#   88          88 88P'    "8a  88    88 88P'   "88"    "8a 88      a8P" a8P_____88
+#   Y8,        ,8P 88       d8  88    88 88      88      88 88   ,d8P'   8PP"""""""
+#    Y8a.    .a8P  88b,   ,a8"  88,   88 88      88      88 88 ,d8"      "8b,   ,aa
+#     `"Y8888Y"'   88`YbbdP"'   "Y888 88 88      88      88 88 888888888  `"Ybbd8"'
+#                  88
+#                  88
+########################################################################################
+
+
+def signature(e):
+    """
+    A "signature" is a loose hash.
+    Optimization might change the expression a lot, so the signature
+    should really be the same for two experessions which compute the
+    same quantities, which we know is uncomputable.
+
+    This just computes the freevars of the expression, which will generally
+    be the list of external functions called. For trivial optimizations this
+    may be fine, but e.g. DCE or user-level rewrites might result in fewer
+    functions being called...
+    """
+    fvs = {v.name for v in freevars(e)}
+    return set.union(fvs, {g_tuple.name, g_identity.name})
+
+
+def optimize(e: Expr) -> Expr:
+    def run(transformation_name, ex, transformation=None):
+        print(f"Running {transformation_name}")
+        if not transformation:
+            if transformation_name.startswith("t-"):
+                transformation = globals()[transformation_name[2:]]
+                transformation = transform_postorder(transformation)
+            else:
+                transformation = globals()[transformation_name]
+
+        new_ex = transformation(ex)
+
+        ex2py(f"{run.count:02d}-{transformation_name}", new_ex)
+        run.count += 1
+
+        osig = signature(ex)
+        sig = signature(new_ex)
+        if sig != osig:
+            assert False
+        return new_ex
+
+    run.count = 1
+
+    print(f"Starting optimization, {str(signature(e))[:80]}")
+    ex2py(f"00-before-optimization", e)
+    e = run("uniquify_names", e)
+    for t in (
+        elide_empty_lhs,
+        inline_call_of_lambda,
+        inline_trivial_letbody,
+        inline_lambda_of_call,
+        inline_lambda_of_let_of_call,
+        identify_identities,
+        eliminate_identities,
+    ):
+        e = run("t-" + t.__name__, e, transform_postorder(t))
+
+    e = run("to_anf", e)
+    e = run("t-detuple_tuple_assignments", e)
+    e = run("inline_trivial_assignments", e)
+
+    for t in (eliminate_identities,):
+        e = run("t-" + t.__name__, e, transform_postorder(t))
+
+    e = run("inline_trivial_assignments", e)
+
+    ex2py(f"99-after-optimization", e)
+
+    return e
 
 
 def inline_call_of_lambda(e: Expr) -> Expr:
@@ -558,6 +623,12 @@ def let_to_lambda(e: Expr) -> Expr:
         return Call(Lambda(args, body), vals)
 
 
+def test_let_to_lambda():
+    e = from_ast(ast.parse("let x = 2, y = 3 in x + y"))
+    l = transform_postorder(let_to_lambda, e)
+    assert l.isCall and l.f.isLambda and len(l.args) == 2
+
+
 def elide_empty_lhs(e: Expr) -> Expr:
     """
     let [] = val1, x2 = val2 in body
@@ -576,12 +647,16 @@ def elide_empty_lhs(e: Expr) -> Expr:
 
 
 def ex2py(name, ex):
+    fvs = list(v.name for v in freevars(ex))
+
     filename = "tmp/ex-" + name + ".txt"
     with open(filename, "w") as f:
+        print("Freevars:", *fvs, file=f)
         pprint(ex, stream=f)
 
     filename = "tmp/py-" + name + ".py"
     with open(filename, "w") as f:
+        print("#Freevars:", *fvs, file=f)
         print(astunparse.unparse(to_ast(ex, "ret")), file=f)
 
 
@@ -599,72 +674,6 @@ def eliminate_identities(e: Expr) -> Expr:
     """
     if e.isCall and e.f == g_identity:
         return mkTuple(e.args)
-
-
-def optimize(e: Expr) -> Expr:
-    def signature(e):
-        """
-        A "signature" is a loose hash.
-        Optimization might change the expression a lot, so the signature
-        should really be the same for two experessions which compute the
-        same quantities, which we know is uncomputable.
-
-        This just computes the freevars of the expression, which will essentially
-        be the list of external functions called. For trivial optimizations this
-        may be fine, but e.g. DCE or user-level rewrites might result in fewer
-        functions being called...
-        """
-        fvs = {v.name for v in freevars(e)}
-        return set.union(fvs, {g_tuple.name, g_identity.name})
-
-    def run(transformation_name, ex, transformation=None):
-        print(f"Running {transformation_name}")
-        if not transformation:
-            if transformation_name.startswith("t-"):
-                transformation = globals()[transformation_name[2:]]
-                transformation = transform_postorder(transformation)
-            else:
-                transformation = globals()[transformation_name]
-
-        new_ex = transformation(ex)
-
-        ex2py(f"{run.count:02d}-{transformation_name}", new_ex)
-        run.count += 1
-
-        osig = signature(ex)
-        sig = signature(new_ex)
-        if sig != osig:
-            assert False
-        return new_ex
-
-    run.count = 1
-
-    print(f"Starting optimization, {str(signature(e))[:80]}")
-    ex2py(f"00-before-optimization", e)
-    e = run("uniquify_names", e)
-    for t in (
-        elide_empty_lhs,
-        inline_call_of_lambda,
-        inline_trivial_letbody,
-        inline_lambda_of_call,
-        inline_lambda_of_let_of_call,
-        identify_identities,
-        eliminate_identities,
-    ):
-        e = run("t-" + t.__name__, e, transform_postorder(t))
-
-    e = run("to_anf", e)
-    e = run("t-detuple_tuple_assignments", e)
-    e = run("inline_trivial_assignments", e)
-
-    for t in (eliminate_identities,):
-        e = run("t-" + t.__name__, e, transform_postorder(t))
-
-    e = run("inline_trivial_assignments", e)
-
-    ex2py(f"99-after-optimization", e)
-
-    return e
 
 
 def test_let_to_lambda():
@@ -775,24 +784,27 @@ def test_uniquify_names():
     assert out.body.eqns[0].vars[0] != out.eqns[0].vars[0]
 
 
-######################################################################################
+########################################################################################
 #
-#    oooooooooooo                       oooo
-#    `888'     `8                       `888
-#     888         oooo    ooo  .oooo.    888
-#     888oooo8     `88.  .8'  `P  )88b   888
-#     888    "      `88..8'    .oP"888   888
-#     888       o    `888'    d8(  888   888
-#    o888ooooood8     `8'     `Y888""8o o888o
 #
-######################################################################################
-
+#   88888888888                    88
+#   88                             88
+#   88                             88
+#   88aaaaa 8b       d8 ,adPPYYba, 88
+#   88""""" `8b     d8' ""     `Y8 88
+#   88       `8b   d8'  ,adPPPPP88 88
+#   88        `8b,d8'   88,    ,88 88
+#   88888888888 "8"     `"8bbdP"Y8 88
+#
+#
+########################################################################################
 
 def run_eval(e: Expr, bindings: Dict[str, Any]) -> Any:
     new_bindings = {Var(key): val for key, val in bindings.items()}
     # Check all the freevars have been bound
-    for v in freevars(e):
-        assert v in new_bindings
+    unbound_vars = [v.name for v in set(freevars(e)) - set(new_bindings)]
+    if len(unbound_vars) > 0:
+        raise ValueError(f"Unbound variable(s): {','.join(unbound_vars)}")
 
     return run_eval_aux(e, new_bindings)
 
@@ -854,7 +866,6 @@ def run_eval_aux(e: Expr, bindings: Dict[Var, Any]) -> Any:
 
 
 def test_eval():
-    import operator
 
     a, b, c = mkvars("a,b,c")
     f_tuple, f_add = mkvars("tuple, add")
@@ -879,20 +890,74 @@ def test_eval():
     assert v == 5
 
 
-######### To AST
+########################################################################################
+#
+#
+#   888888888888                  db        ad88888ba 888888888888
+#        88                      d88b      d8"     "8b     88
+#        88                     d8'`8b     Y8,             88
+#        88  ,adPPYba,         d8'  `8b    `Y8aaaaa,       88
+#        88 a8"     "8a       d8YaaaaY8b     `"""""8b,     88
+#        88 8b       d8      d8""""""""8b          `8b     88
+#        88 "8a,   ,a8"     d8'        `8b Y8a     a8P     88
+#        88  `"YbbdP"'     d8'          `8b "Y88888P"      88
+#
+#
+########################################################################################
 
-######################################################################################
-#
-#          .o.        .oooooo..o ooooooooooooo
-#        .888.      d8P'    `Y8 8'   888   `8
-#        .8"888.     Y88bo.           888
-#      .8' `888.     `"Y8888o.       888
-#      .88ooo8888.        `"Y88b      888
-#    .8'     `888.  oo     .d8P      888
-#    o88o     o8888o 8""88888P'      o888o
-#
-#
-######################################################################################
+import re
+
+
+def prettify_repr(s):
+    """
+    Perform various transformations to make the repr of a value more readable
+       builtins.() -> ()
+       numpy.dtypes.dtype('int32') -> np.int32
+    """
+    s = re.sub(r"^builtins\.", "", s)
+    s = re.sub(r"^numpy\.dtypes\.dtype\('(\w+)'\)", r"np.\1", s)
+    s = re.sub(r"^numpy\.(array.*), dtype=(\w+)", r"np.\1, dtype=np.\2", s)
+    s = re.sub(r"^numpy\.", r"np.", s)
+    s = re.sub(r"^jax._src.lax.slicing", "jax.lax", s)
+    return s
+
+
+_ast_cmpops = {
+    "__eq__": ast.Eq,
+    "__ne__": ast.NotEq,
+    "__lt__": ast.Lt,
+    "__le__": ast.LtE,
+    "__gt__": ast.Gt,
+    "__ge__": ast.GtE,
+}
+
+_ast_binops = {
+    "__add__": ast.Add,
+    "__sub__": ast.Sub,
+    "__mul__": ast.Mult,
+    "__floordiv__": ast.Div,
+    "__truediv__": ast.Div,
+    "__floordiv__": ast.FloorDiv,
+    "__mod__": ast.Mod,
+    "__pow__": ast.Pow,
+    "__lshift__": ast.LShift,
+    "__rshift__": ast.RShift,
+    "__or__": ast.BitOr,
+    "__xor__": ast.BitXor,
+    "__and__": ast.BitAnd,
+    "__matmul__": ast.MatMult,
+}
+
+_ast_unaryops = {
+    "__neg__": ast.USub,
+    "__pos__": ast.UAdd,
+    "__not__": ast.Not,
+    "__inv__": ast.Invert,
+}
+
+_ast_ops = _ast_cmpops | _ast_binops | _ast_unaryops
+
+_ast_op_to_operator = {v: k for k, v in _ast_ops.items()}
 
 
 def to_ast_FunctionDef(name, args, body):
@@ -905,8 +970,45 @@ def to_ast(e, name):
     expr = to_ast_aux(e, assignments)
     assignments += [ast.Assign([ast.Name(name, ast.Store())], expr)]
     a = ast.Module(body=assignments, type_ignores=[])
+    # Do one pass to inline '**dict'
+    a = _RewriteCall().visit(a)
     ast.fix_missing_locations(a)
     return a
+
+
+class _RewriteCall(ast.NodeTransformer):
+
+    def visit_Call(self, node):
+        func = self.visit(node.func)
+        args = []
+        keywords = []
+        for arg in node.args:
+            if (
+                ## Is it a splat?
+                (isinstance(arg, ast.keyword) and arg.arg is None)
+                and
+                ## It's a splat, is it a call of dict?
+                (
+                    isinstance(arg.value, ast.Call)
+                    and isinstance(arg.value.func, ast.Name)
+                    and arg.value.func.id == "dict"
+                )
+            ):
+                # Add the keywords to the keywords list, nothing to args
+                keywords += [self.visit(kw) for kw in arg.value.keywords]
+            else:
+                # Just add to args
+                args += [self.visit(arg)]
+
+        for k in node.keywords:
+            arg = k.arg
+            if arg is None:
+                # Splatting
+                pass
+            value = self.visit(k.value)
+            keywords += [ast.keyword(arg=arg, value=value)]
+
+        return ast.Call(func, args, keywords)
 
 
 @beartype
@@ -930,6 +1032,8 @@ def to_ast_constant(val):
         rep = str(val)
     else:
         rep = repr(val)
+    rep = type(val).__module__ + "." + rep
+    rep = prettify_repr(rep)
 
     module = ast.parse(rep)
     ast_expr: ast.Expr = module.body[0]
@@ -984,9 +1088,43 @@ def to_ast_aux(e, assignments, binders=None):
         return to_ast_aux(v, None)
 
     if e.isCall:
-        f = to_ast_aux(e.f, assignments)
+        # Special case: **_pairs_to_dict
+        if e.f.isVar and e.f.name == "**_pairs_to_dict":
+            # convert to dict call
+            keywords = [
+                ast.keyword(arg=k.val, value=to_ast_aux(value, assignments))
+                for k, value in zip(e.args[::2], e.args[1::2])
+            ]
+            dictval = ast.Call(
+                func=ast.Name("dict", ast.Load()), args=[], keywords=keywords
+            )
+            # Splatting is a keyword with arg=None
+            return ast.keyword(value=dictval)
+
         args = [to_ast_aux(arg, assignments) for arg in e.args]
-        return ast.Call(func=f, args=args, keywords=[])
+        f = to_ast_aux(e.f, assignments)
+
+        if isinstance(f, ast.Name) and f.id.startswith("operator."):
+            # Special case: operator.*
+            op = f.id[9:]
+            if op in _ast_cmpops:
+                ops = [_ast_cmpops[op]()]
+                return ast.Compare(left=args[0], ops=ops, comparators=[args[1]])
+
+            if op in _ast_binops:
+                return ast.BinOp(left=args[0], op=_ast_binops[op](), right=args[1])
+
+            if op in _ast_unaryops:
+                return ast.UnaryOp(op=_ast_unaryops[op](), operand=args[0])
+
+            assert False, f"Unknown operator {op}"
+        elif isinstance(f, ast.Name) and f.id == "getattr":
+            # Special case: getattr
+            assert len(args) == 2
+            return ast.Attribute(value=args[0], attr=args[1].value, ctx=ast.Load())
+        else:
+            # Normal case
+            return ast.Call(func=f, args=args, keywords=[])
 
     assert False
 
@@ -1012,7 +1150,20 @@ def test_ast():
     # exec(code)
 
 
-#### From AST
+########################################################################################
+#
+#
+#   88888888888                                                 db        ad88888ba 888888888888
+#   88                                                         d88b      d8"     "8b     88
+#   88                                                        d8'`8b     Y8,             88
+#   88aaaaa 8b,dPPYba,  ,adPPYba,  88,dPYba,,adPYba,         d8'  `8b    `Y8aaaaa,       88
+#   88""""" 88P'   "Y8 a8"     "8a 88P'   "88"    "8a       d8YaaaaY8b     `"""""8b,     88
+#   88      88         8b       d8 88      88      88      d8""""""""8b          `8b     88
+#   88      88         "8a,   ,a8" 88      88      88     d8'        `8b Y8a     a8P     88
+#   88      88          `"YbbdP"'  88      88      88    d8'          `8b "Y88888P"      88
+#
+#
+########################################################################################
 
 
 def from_ast(a: ast.AST):
@@ -1067,8 +1218,8 @@ def from_ast(a: ast.AST):
     if isinstance(a, ast.Name):
         return Var(a.id)
 
-    if isinstance(a, ast.operator):
-        return Var("ast." + type(a).__name__)
+    # if isinstance(a, ast.operator):
+    #     return Var("ast." + type(a).__name__)
 
     # Nodes which encode to (Var or Call)
     if isinstance(a, ast.Attribute):
@@ -1091,7 +1242,9 @@ def from_ast(a: ast.AST):
         return Call(g_tuple, [recurse(e) for e in a.elts])
 
     if isinstance(a, ast.BinOp):
-        return Call(recurse(a.op), [recurse(a.left), recurse(a.right)])
+        operator_op = _ast_op_to_operator[type(a.op)]  # check that op is in the dict
+        op = Var("operator." + operator_op)
+        return Call(op, [recurse(a.left), recurse(a.right)])
 
     if isinstance(a, ast.Subscript):
         return Call(Var("ast.Subscript"), [recurse(a.value), recurse(a.slice)])
@@ -1121,17 +1274,13 @@ def test_ast_to_expr():
     e = expr_for(foo)
     print(expr_to_python_code(e, "foo"))
 
-    import operator
-
     got = eval_expr(
         e,
         [5],
         {
-            "ast.Mult": operator.mul,
-            "ast.Add": operator.add,
-            "jnp": jnp,
-            "tuple": lambda *args: tuple(args),
+            "g_tuple": lambda *args: tuple(args),
             "getattr": getattr,
+            "jnp": jnp,
         },
     )
     assert expected == got
@@ -1152,7 +1301,6 @@ def test_ast_to_expr2():
 
     e_foo = expr_for(foo)
     print(expr_to_python_code(e_foo, "foo"))
-    import operator
 
     got = eval_expr(
         e_foo,
@@ -1184,18 +1332,10 @@ def expr_to_python_code(e: Expr, name: str) -> str:
     return astunparse.unparse(as_ast)
 
 
+def bindings_for_operators():
+    return {("operator." + op): operator.__dict__[op] for op in _ast_ops.keys()}
+
+
 def eval_expr(e: Expr, args, bindings):
+    bindings |= bindings_for_operators()
     return run_eval(Call(e, [Const(a) for a in args]), bindings)
-
-
-######################################################################################
-#
-#
-#
-#
-#
-#
-#
-#
-#
-######################################################################################

@@ -19,7 +19,7 @@ from jax.extend import linear_util as jaxlu
 from pprint import pprint
 
 import jaxutils
-from jaxutils.expr import Expr, Var, Const, Lambda, Eqn, Let, Call, mkTuple
+from jaxutils.expr import Expr, Var, Const, Lambda, Eqn, Let, Call, mkTuple, isNone
 
 from jaxutils.expr import (
     dictassign,
@@ -43,7 +43,7 @@ def kwargs_to_dict_call(dict):
         return []
 
     dict_pairs = [[Const(key), val] for key, val in dict.items()]
-    return [Call(Var("**jaxutils_p2d"), list(itertools.chain(*dict_pairs)))]
+    return [Call(Var("**_pairs_to_dict"), list(itertools.chain(*dict_pairs)))]
 
 
 def new_call(fn: str, *args, **kwargs):
@@ -80,28 +80,78 @@ def declare_prim_to_expr(prim):
     return dictassign(_prim_to_expr, prim)
 
 
-@declare_prim_to_expr(lax.convert_element_type_p)
-def _(val, new_dtype=None, weak_type=False, sharding=None):
-    if weak_type.val == False:
-        return new_call("convert_element_type", val, new_dtype)
+_prim_to_expr_simple = {
+    lax.eq_p: "operator.__eq__",
+    lax.ne_p: "operator.__ne__",
+    lax.lt_p: "operator.__lt__",
+    lax.le_p: "operator.__le__",
+    lax.gt_p: "operator.__gt__",
+    lax.ge_p: "operator.__ge__",
+    lax.add_p: "operator.__add__",
+    lax.sub_p: "operator.__sub__",
+    lax.mul_p: "operator.__mul__",
+    lax.div_p: "operator.__truediv__",
+    lax.pow_p: "operator.__pow__",
+    lax.neg_p: "operator.__neg__",
+    lax.squeeze_p: "squeeze",
+    lax.max_p: "jnp.max",
+    lax.square_p: "lax.square",
+    lax.exp_p: "lax.exp",
+    lax.sqrt_p: "lax.sqrt",
+    # lax.rem_p: "operator.__mod__",
+    # lax.lshift_p: "operator.__lshift__",
+    # lax.rshift_p: "operator.__rshift__",
+    # lax.bitor_p: "operator.__bitor__",
+    # lax.bitxor_p: "operator.__bitxor__",
+    # lax.bitand_p: "operator.__bitand__",
+    # lax.matmul_p: "operator.__matmul__",
+}
+
+for prim, fn in _prim_to_expr_simple.items():
+    _prim_to_expr[prim] = lambda *args, _prim_to_expr_fn=fn, **kwargs: new_call(
+        _prim_to_expr_fn, *args, **kwargs
+    )
 
 
 @declare_prim_to_expr(lax.broadcast_in_dim_p)
-def _(val, shape=None, broadcast_dimensions=None, sharding=None):
-    return new_call("broadcast_in_dim", val, shape, broadcast_dimensions)
+def _(x, shape=None, broadcast_dimensions=None, sharding=None):
+    return new_call(
+        "jax.lax.broadcast_in_dim",
+        x,
+        shape,
+        broadcast_dimensions,
+        out_sharding=sharding,
+    )
 
 
-@declare_prim_to_expr(lax.squeeze_p)
-def _(val, dimensions=None):
-    return new_call("squeeze", val, dimensions)
+@declare_prim_to_expr(lax.transpose_p)
+def _(x, permutation=None):
+    if permutation.isConst and permutation.val == (1, 0):
+        return new_call("getattr", x, Const("T"))
+    else:
+        return new_call("jnp.transpose", x, axes=permutation)
+
+
+@declare_prim_to_expr(lax.log_p)
+def _(x, accuracy=None):
+    if isNone(accuracy):
+        return new_call("jnp.log", x)
+    else:
+        return new_call("jnp.log", x, accuracy=accuracy)
+
+
+@declare_prim_to_expr(lax.convert_element_type_p)
+def _(val, new_dtype=None, weak_type=False, sharding=None):
+    if weak_type.val == False:
+        return new_call("lax.convert_element_type", val, new_dtype)
 
 
 @declare_prim_to_expr(lax.slice_p)
 def _(val, start_indices=None, limit_indices=None, strides=None):
     if not strides or not strides.val or all(v == 1 for v in strides.val):
-        return new_call("slice", val, start_indices, limit_indices)
+        return new_call("lax.slice", val, start_indices, limit_indices)
     else:
-        return new_call("slice", val, start_indices, limit_indices, strides=strides)
+        return new_call("lax.slice", val, start_indices, limit_indices, strides=strides)
 
 
 @declare_prim_to_expr(lax.dot_general_p)
@@ -113,17 +163,34 @@ def _(
     preferred_element_type=None,
     out_sharding=None,
 ):
-    if precision.val is None and preferred_element_type.val is None:
+    if (
+        isNone(precision)
+        and (isNone(preferred_element_type) or preferred_element_type.val == np.float32)
+        and isNone(out_sharding)
+    ):
         # TODO Reverse-engineer to matmul where that's true, and if kwargs are default
         # mm_pattern = (((1,), (0,)), ((), ()))
         # if dimension_numbers == mm_pattern:
         #     ...
+        (
+            (lhs_contracting_dims, rhs_contracting_dims),
+            (lhs_batch_dims, rhs_batch_dims),
+        ) = dimension_numbers.val
+        if lhs_batch_dims == () and rhs_batch_dims == ():
+            # This is a matmul
+            if lhs_contracting_dims == (1,) and rhs_contracting_dims == (0,):
+                # This is a matmul, but
+                # TODO: only if we know shape is 2D and dtype matches preferred...
+                return new_call("operator.__matmul__", a, b)
 
-        return new_call("dot_general", a, b, dimension_numbers)
+            # # This is a transpose
+            # if lhs_contracting_dims == (0,) and rhs_contracting_dims == (1,):
+            #     # This is a transpose
+            #     return new_call("operator.__matmul__", a, b)
 
     # Or just call the general
     return new_call(
-        "dot_general",
+        "lax.dot_general",
         a,
         b,
         dimension_numbers,
@@ -174,7 +241,6 @@ def _(
         pjit_name_count += 1
         return Let([Eqn([f], jaxpr)], Call(f, list(args)))
 
-
 @declare_prim_to_expr(jax.lax.scatter_add_p)
 def _(*args, **kwargs):
     #    v_35 = scatter_add(
@@ -186,7 +252,7 @@ def _(*args, **kwargs):
     #             inserted_window_dims=(1,),
     #             scatter_dims_to_operand_dims=(1,),
     #         ),
-    #     **jaxutils_p2d(
+    #     **_pairs_to_dict(
     #         "indices_are_sorted",
     #         True,
     #         "unique_indices",
@@ -204,7 +270,7 @@ def _(*args, **kwargs):
     # Note that if this assert fails because update_jaxpr is some large complicated thing
     # be aware of possible quadratic complexity in calling optimize
     update_jaxpr = kwargs.pop("update_jaxpr")
-    assert optimize(update_jaxpr) == Var("add_p.bind")
+    assert optimize(update_jaxpr) == Var("operator.__add__")
 
     # Hope update_consts is Const(())
     assert not kwargs.pop("update_consts").val
@@ -267,7 +333,7 @@ import functools
 varname_n = 0
 
 
-@functools.lru_cache
+@functools.cache
 def varname(x):
     global varname_n
     varname_n += 1
@@ -316,14 +382,14 @@ def jaxpr_to_expr_aux(x) -> Expr:
 import inspect
 
 
-def jaxutils_p2d(*pairs):
+def _pairs_to_dict(*pairs):
     it = iter(pairs)
     return {a: b for (a, b) in zip(it, it)}
 
 
-def test_jaxutils_p2d():
-    assert jaxutils_p2d("a", 2, "b", 3) == {"a": 2, "b": 3}
-    assert jaxutils_p2d() == {}
+def test__pairs_to_dict():
+    assert _pairs_to_dict("a", 2, "b", 3) == {"a": 2, "b": 3}
+    assert _pairs_to_dict() == {}
 
 
 def show_jaxpr(
@@ -331,8 +397,10 @@ def show_jaxpr(
     args,
     name=None,
     file=sys.stdout,
-    add_decls=None,
     optimize=True,
+    add_decls=None,
+    add_jaxpr=False,
+    add_hlo=False,
     static_argnums=(),
     **kwargs,
 ):
@@ -369,23 +437,29 @@ def show_jaxpr(
     as_ast = to_ast(e, name)
     body_code = astunparse.unparse(as_ast)
 
+    fvs = list(v.name for v in jaxutils.expr.freevars(e))
+    fvs_prims = list(
+        v[:-5] for v in fvs if v.endswith(".bind") and v != "add_any_p.bind"
+    )
+
     if add_decls:
         print(
             f"""#
 # show_jaxpr {f}
-from numpy import float32,int32
-from jax.lax import *
-from jax.lax import transpose_p
-import jax.numpy as jnp
-import jax
 import numpy as np
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax.lax import *
 
-nan = jnp.nan
-array = jnp.array
+from numpy import (inf, nan)
 
-from jax._src.ad_util import add_any_p
-
-{inspect.getsource(jaxutils_p2d)}
+from jax.extend.core.primitives import (
+   {",\n   ".join(fvs_prims)},
+   add_jaxvals_p
+)
+from jax.extend.core.primitives import add_jaxvals_p as add_any_p
+g_tuple = lambda *a: tuple(a)
 """,
             file=file,
         )
@@ -400,7 +474,13 @@ from jax._src.ad_util import add_any_p
         if static_argnums:
             del non_static_args[static_argnums]
         flat_args = jax.tree_util.tree_leaves(non_static_args)
-        test_args = ",".join(repr(arg) for arg in flat_args)
+        def test_repr(x):
+            if hasattr(x, "dtype"):
+                return f"np.random.rand{x.shape}.astype(np.{x.dtype})"
+            else:
+                return repr(x)
+
+        test_args = ",".join(test_repr(arg) for arg in flat_args)
 
         print(
             f"""
@@ -410,7 +490,7 @@ if __name__ == '__main__':
             file=file,
         )
 
-    if add_decls:
+    if add_jaxpr:
         # Dump jaxpr too
         print(
             """
@@ -430,7 +510,7 @@ if __name__ == '__main__':
 
         print('jaxpr  = """', closed_jaxpr, '"""', file=file)
 
-    if add_decls:
+    if add_hlo:
         # Dump XLA too
         print(
             """
@@ -495,6 +575,23 @@ def test_basic():
     #     gradf, args, is_python_returned=True
     # )
     # print(python_code)
+
+
+def test_emit_readme():
+    def ffn(W, x):
+        ((W1, b1), (W2, b2)) = W
+        t1 = W1 @ x + b1
+        y1 = jax.nn.relu(t1)
+        y2 = W2 @ y1 + b2
+        return jax.nn.softmax(y2)
+
+    W = (
+        (np.random.rand(11, 7), np.random.rand(11)),
+        (np.random.rand(10, 11), np.random.rand(10)),
+    )
+    x = np.random.rand(7)
+
+    show_jaxpr(ffn, (W, x))
 
 
 def test_vmap():

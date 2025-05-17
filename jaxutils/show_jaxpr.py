@@ -11,6 +11,7 @@ import jax._src as jaxsrc
 from jax.extend import core as jaxcore
 from jax._src import source_info_util as jaxsi
 
+import pytest
 
 def isJaxpr(x):
     return isinstance(x, (jaxcore.Jaxpr, jaxcore.ClosedJaxpr))
@@ -232,20 +233,6 @@ def print_jaxpr_as_python(f, jaxpr, *, indent="", doc="", file=sys.stdout):
 
 
 def get_primitive_name(eqn):
-    if eqn.primitive is lax.scatter_add_p:
-        return "scatter_add"
-
-    if False and (
-        eqn.primitive
-        in (
-            lax.select_n_p,
-            lax.broadcast_in_dim_p,
-            lax.gather_p,
-            lax.reduce_sum_p,
-        )
-    ):
-        return eqn.primitive.name
-
     return eqn.primitive.name + "_p.bind"
 
 
@@ -487,11 +474,12 @@ def test_basic():
     print("f(args)=")
     print(f(*args))
 
-    show_jaxpr(f, args, name="f")
+    old_show_jaxpr(f, args, name="f")
     # show_xla(f, args)
     # show_xla(f, args, optimized=True)
 
 
+@pytest.mark.skip(reason="deprecating old_show_jaxpr")
 def test_roundtrip():
     import os
 
@@ -513,7 +501,7 @@ def test_roundtrip():
     # Save to file
     fn = "tmp/show_jaxpr_jaxpr.py"
     with open(fn, "w") as file:
-        show_jaxpr(f, args, name="f", file=file, add_decls=True)
+        old_show_jaxpr(f, args, name="f", file=file, add_decls=True)
 
     os.system(f"black {fn}")
 
@@ -532,7 +520,7 @@ def test_roundtrip():
     # Save again
     fn2 = "tmp/show_jaxpr_roundtrip.py"
     with open(fn2, "w") as file2:
-        show_jaxpr(module.f, args, file=file2, add_decls=True)
+        old_show_jaxpr(module.f, args, file=file2, add_decls=True)
 
     os.system(f"black {fn2}")
 
@@ -548,7 +536,7 @@ def test_roundtrip():
     # Sand save 2nd roundtrip
     fn3 = "tmp/show_jaxpr_roundtrip2.py"
     with open(fn3, "w") as file3:
-        show_jaxpr(module2.f, args, file=file3, add_decls=True)
+        old_show_jaxpr(module2.f, args, file=file3, add_decls=True)
 
     os.system(f"black {fn3}")
 
