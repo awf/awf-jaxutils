@@ -307,22 +307,21 @@ def test_basic():
 
 def preorder_visit(e: Expr, f: Callable[[Expr], Any]):
     # Call f on e
-    f(e)
+    yield f(e)
 
     # And recurse into Expr children
     if e.isLet:
         for eqn in e.eqns:
-            preorder_visit(eqn.val, f)
-        preorder_visit(e.body, f)
+            yield from preorder_visit(eqn.val, f)
+        yield from preorder_visit(e.body, f)
 
     if e.isLambda:
-        preorder_visit(e.body, f)
+        yield from preorder_visit(e.body, f)
 
     if e.isCall:
-        preorder_visit(e.f, f)
+        yield from preorder_visit(e.f, f)
         for arg in e.args:
-            preorder_visit(arg, f)
-
+            yield from preorder_visit(arg, f)
 
 def test_visit():
     e = _make_e()
@@ -479,6 +478,40 @@ def detuple_tuple_assignments(e: Expr) -> Expr:
 
     new_eqns = list(chain(*map(detuple_eqn, e.eqns)))
     return Let(new_eqns, e.body)
+
+# from collections import Counter
+
+# def hash_expr(e):
+#     if e.isConst:
+#         return hash(e.val)
+
+#     if e.isVar:
+#         return hash(e.name)
+
+#     if e.isCall:
+#         myhash = hash_expr(e.f,) + tuple(hash(arg) for arg in e.args)
+
+#     if e.isLet:
+#         return (e.eqns,) + tuple(hash(e.body))
+
+#     if e.isLambda:
+#         return (e.args,) + hash(e.body)
+
+# def cse(e):
+#     """
+#     Common Subexpression Elimination
+#     """
+#     ## Count occurrences
+
+
+# def test_cse():
+#     def foo(x):
+#         a = str(x)
+#         b = str(x)
+#         return a + b
+
+#     e = expr_for(foo)
+#     cse(e)
 
 
 def to_anf(e):
@@ -960,23 +993,24 @@ _ast_ops = _ast_cmpops | _ast_binops | _ast_unaryops
 _ast_op_to_operator = {v: k for k, v in _ast_ops.items()}
 
 
-def to_ast_FunctionDef(name, args, body):
-    return ast.FunctionDef(name=name, args=args, body=body, decorator_list=[], lineno=0)
-
+lambda_to_name = {}
 
 def to_ast(e, name):
     e = uniquify_names(e)
+    global lambda_to_name
+    lambda_to_name = {}
+
     assignments = []
     expr = to_ast_aux(e, assignments)
     assignments += [ast.Assign([ast.Name(name, ast.Store())], expr)]
     a = ast.Module(body=assignments, type_ignores=[])
     # Do one pass to inline '**dict'
-    a = _RewriteCall().visit(a)
+    a = _RewriteDictCallToSplat().visit(a)
     ast.fix_missing_locations(a)
     return a
 
 
-class _RewriteCall(ast.NodeTransformer):
+class _RewriteDictCallToSplat(ast.NodeTransformer):
 
     def visit_Call(self, node):
         func = self.visit(node.func)
@@ -1054,19 +1088,8 @@ def to_ast_aux(e, assignments, binders=None):
             if len(avars) > 1:
                 avars = [ast.Tuple(avars, ast.Store())]
 
-            aval = to_ast_aux(eqn.val, assignments, binders=eqn.vars)
-            # If it was a function definition, it will have emitted
-            # def foo(...):
-            # and returned Name(foo)
-            # so we would be adding an assignment foo = foo
-            elide = (
-                isinstance(aval, ast.Name)
-                and len(eqn.vars) == 1
-                and aval.id == eqn.vars[0].name
-            )
-            if not elide:
-                assign = ast.Assign(targets=avars, value=aval)
-                assignments += [assign]
+            if aval := to_ast_aux(eqn.val, assignments, binders=eqn.vars):
+                assignments += [ast.Assign(targets=avars, value=aval)]
 
         inner_assignments = []
         abody = to_ast_aux(e.body, inner_assignments)
@@ -1074,18 +1097,34 @@ def to_ast_aux(e, assignments, binders=None):
         return abody
 
     if e.isLambda:
-        inner_assignments = []
-        abody = to_ast_aux(e.body, inner_assignments)
-        inner_assignments += [ast.Return(abody)]
+        # If I know whom I am bound to, then use that name for the FunctionDef
         if binders is None:
             v = Var("f" + get_new_name())
         else:
             assert len(binders) == 1
             v = binders[0]
-        aargs = to_ast_args(e.args)
-        fdef = to_ast_FunctionDef(v.name, aargs, inner_assignments)
-        assignments += [fdef]
-        return to_ast_aux(v, None)
+
+        # Recurse, generating inner assignments
+        inner_assignments = []
+        abody = to_ast_aux(e.body, inner_assignments)
+        inner_assignments += [ast.Return(abody)]
+
+        # Make a FunctionDef
+        assignments += [
+            ast.FunctionDef(
+                name=v.name,
+                args=to_ast_args(e.args),
+                body=inner_assignments,
+                decorator_list=[],
+                lineno=0,
+            )
+        ]
+
+        # And return a reference to the function's name
+        if binders is None:
+            return ast.Name(v.name, ast.Load())
+        else:
+            return None
 
     if e.isCall:
         # Special case: **_pairs_to_dict

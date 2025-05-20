@@ -3,6 +3,7 @@ import sys
 import re
 import numpy as np
 import itertools
+import functools
 
 from beartype.typing import Callable, Optional, Any, Dict, List
 from beartype import beartype
@@ -15,6 +16,7 @@ import jax.numpy as jnp
 import jax._src as jaxsrc
 from jax.extend import core as jaxcore
 from jax.extend import linear_util as jaxlu
+from jax.extend.core import primitives as jaxprim
 
 from pprint import pprint
 
@@ -88,16 +90,19 @@ _prim_to_expr_simple = {
     lax.gt_p: "operator.__gt__",
     lax.ge_p: "operator.__ge__",
     lax.add_p: "operator.__add__",
+    jaxprim.add_jaxvals_p: "operator.__add__",
     lax.sub_p: "operator.__sub__",
     lax.mul_p: "operator.__mul__",
     lax.div_p: "operator.__truediv__",
     lax.pow_p: "operator.__pow__",
     lax.neg_p: "operator.__neg__",
-    lax.squeeze_p: "squeeze",
-    lax.max_p: "jnp.max",
+    lax.squeeze_p: "lax.squeeze",
+    lax.max_p: "lax.max",
     lax.square_p: "lax.square",
     lax.exp_p: "lax.exp",
     lax.sqrt_p: "lax.sqrt",
+    lax.select_n_p: "lax.select_n",
+    lax.stop_gradient_p: "lax.stop_gradient",
     # lax.rem_p: "operator.__mod__",
     # lax.lshift_p: "operator.__lshift__",
     # lax.rshift_p: "operator.__rshift__",
@@ -113,10 +118,15 @@ for prim, fn in _prim_to_expr_simple.items():
     )
 
 
+@declare_prim_to_expr(lax.integer_pow_p)
+def _(x, y=0):
+    return new_call("operator.__pow__", x, y)
+
+
 @declare_prim_to_expr(lax.broadcast_in_dim_p)
 def _(x, shape=None, broadcast_dimensions=None, sharding=None):
     return new_call(
-        "jax.lax.broadcast_in_dim",
+        "lax.broadcast_in_dim",
         x,
         shape,
         broadcast_dimensions,
@@ -226,20 +236,30 @@ def _(
     compiler_options_kvs=None,
     ctx_mesh=None,
 ):
-    # Elide the call if the shardings are unspecified
-    if (
-        translate_pjit_passthru
-        and not name
-        and unspecified(in_shardings.val)
-        and unspecified(out_shardings.val)
-    ):
-        return Call(jaxpr, list(args))
-
     if name:
         global pjit_name_count
         f = Var(f"pjit_{name.val}_{pjit_name_count}")
         pjit_name_count += 1
         return Let([Eqn([f], jaxpr)], Call(f, list(args)))
+    else:
+        # Elide the call if the shardings are unspecified
+        if (
+            translate_pjit_passthru
+            and unspecified(in_shardings.val)
+            and unspecified(out_shardings.val)
+        ):
+            return Call(jaxpr, list(args))
+
+
+@declare_prim_to_expr(jaxprim.custom_jvp_call_p)
+def _(*args, call_jaxpr=None, jvp_jaxpr_fun=None, num_consts=None, symbolic_zeros=None):
+    # From https://github.com/jax-ml/jax/blob/89807ba73ebd96ed8262f11be9ff02b009a30a19/jax/experimental/jax2tf/jax2tf.py#L1444
+    # Just erase the custom_jvp_call; although it does lose the custom_jvp rules
+    # A common example is jnn.relu, which has a custom_jvp rule which would need to be
+    # reinstated in any AD for this Expr library.
+    print(f"custom_jvp_call_p: losing connection to {jvp_jaxpr_fun.val.f_transformed}")
+    return Call(call_jaxpr, list(args))
+
 
 @declare_prim_to_expr(jax.lax.scatter_add_p)
 def _(*args, **kwargs):
@@ -252,13 +272,9 @@ def _(*args, **kwargs):
     #             inserted_window_dims=(1,),
     #             scatter_dims_to_operand_dims=(1,),
     #         ),
-    #     **_pairs_to_dict(
-    #         "indices_are_sorted",
-    #         True,
-    #         "unique_indices",
-    #         True,
-    #         "mode",
-    #         GatherScatterMode.PROMISE_IN_BOUNDS,
+    #         indices_are_sorted=True,
+    #         unique_indices=True,
+    #         mode=GatherScatterMode.PROMISE_IN_BOUNDS,
     #     ),
     # )
 
@@ -270,7 +286,8 @@ def _(*args, **kwargs):
     # Note that if this assert fails because update_jaxpr is some large complicated thing
     # be aware of possible quadratic complexity in calling optimize
     update_jaxpr = kwargs.pop("update_jaxpr")
-    assert optimize(update_jaxpr) == Var("operator.__add__")
+    if not update_jaxpr.isVar:
+        assert optimize(update_jaxpr) == Var("operator.__add__")
 
     # Hope update_consts is Const(())
     assert not kwargs.pop("update_consts").val
@@ -282,22 +299,10 @@ def _(*args, **kwargs):
     return new_call("scatter_add", *args, dimension_numbers, **kwargs)
 
 
-# if xla_call_p:
-
-#     @dictassign(translators, xla_call_p)
-#     def _(*args, **kwargs):
-#         call_jaxpr = kwargs.pop("call_jaxpr")
-#         # TODO:
-#         #   1. check all kwargs are benign before erasing
-#         #   2. make this work if needed
-#         #      xla_call_p wants the jaxpr pulled out of kwargs
-#         #      return Call(Var("xla_call_p.bind"), [call_jaxpr, *args] + kwargs_to_dict_call(kwargs))
-#         return Call(call_jaxpr, list(args))
-
-
+@functools.cache  # TODO: could be LRU, and we would then miss some CSE
 def jaxpr_to_expr(jaxpr) -> Lambda:
     """
-    Convert Jaxpr to jaxutils.Expr
+    Convert Jaxpr to Lambda
     """
 
     # Will return Lambda(args, body)
@@ -327,9 +332,6 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
     return Lambda(args, body)
 
 
-import functools
-
-
 varname_n = 0
 
 
@@ -341,9 +343,10 @@ def varname(x):
 
 
 def jaxpr_to_expr_aux(x) -> Expr:
-    if x is None or isinstance(
+    if isinstance(
         x,
         (
+            types.NoneType,
             tuple,
             jax.lax.GatherDimensionNumbers,
             jax.lax.GatherScatterMode,
@@ -372,7 +375,7 @@ def jaxpr_to_expr_aux(x) -> Expr:
         return Var(varname(x))
 
     if isinstance(x, (types.FunctionType, jaxlu.WrappedFun)):
-        return Const(str(x))
+        return Const(x)
 
     # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
     # Explicitly add verified cases to
@@ -401,6 +404,7 @@ def show_jaxpr(
     add_decls=None,
     add_jaxpr=False,
     add_hlo=False,
+    reset_ids=False,
     static_argnums=(),
     **kwargs,
 ):
@@ -429,6 +433,14 @@ def show_jaxpr(
 
     jaxpr = jax.make_jaxpr(f, static_argnums=static_argnums, **kwargs)
     closed_jaxpr = jaxpr(*args)
+
+    if reset_ids:
+        jaxutils.expr.reset_new_name_ids()
+        global varname_n
+        varname_n = 0
+        global pjit_name_count
+        pjit_name_count = 0
+
     e = jaxpr_to_expr(closed_jaxpr.jaxpr)
 
     if optimize:
@@ -438,9 +450,7 @@ def show_jaxpr(
     body_code = astunparse.unparse(as_ast)
 
     fvs = list(v.name for v in jaxutils.expr.freevars(e))
-    fvs_prims = list(
-        v[:-5] for v in fvs if v.endswith(".bind") and v != "add_any_p.bind"
-    )
+    fvs_prims = list(v[:-5] for v in fvs if v.endswith(".bind"))
 
     if add_decls:
         print(
@@ -458,7 +468,7 @@ from jax.extend.core.primitives import (
    {",\n   ".join(fvs_prims)},
    add_jaxvals_p
 )
-from jax.extend.core.primitives import add_jaxvals_p as add_any_p
+
 g_tuple = lambda *a: tuple(a)
 """,
             file=file,
@@ -471,12 +481,13 @@ g_tuple = lambda *a: tuple(a)
     numpy.set_printoptions(threshold=1e6)  # more than that, let's think about pickling
     if add_decls:
         non_static_args = [*args]
-        if static_argnums:
+        if static_argnums != ():
             del non_static_args[static_argnums]
         flat_args = jax.tree_util.tree_leaves(non_static_args)
+
         def test_repr(x):
             if hasattr(x, "dtype"):
-                return f"np.random.rand{x.shape}.astype(np.{x.dtype})"
+                return f"rand({x.shape}, np.{x.dtype})"
             else:
                 return repr(x)
 
@@ -484,6 +495,12 @@ g_tuple = lambda *a: tuple(a)
 
         print(
             f"""
+def rand(shape, dtype):
+    if np.issubdtype(dtype, np.floating):
+        return jnp.array(np.random.rand(*shape).astype(dtype))
+    else:
+        return jnp.array(np.random.randint(0, 256, shape, dtype))
+
 if __name__ == '__main__':
     {name}({test_args})
 """,
@@ -593,6 +610,8 @@ def test_emit_readme():
 
     show_jaxpr(ffn, (W, x))
 
+    show_jaxpr(jax.grad(lambda W, x: -jnp.log(ffn(W, x)[5])), (W, x))
+
 
 def test_vmap():
     def foo(p, x):
@@ -625,24 +644,28 @@ def load_module(filename, module_name):
     return module
 
 
-@pytest.mark.parametrize("n", [0, 1])
+@pytest.mark.parametrize("n", ("f", "vmapgradf"))
 def test_roundtrip(n):
     import os
 
     def foo(p, x):
         x = jax.numpy.matmul(x, p * x.T)
+        x = jax.nn.relu(x)
+        x = jax.nn.softmax(x)
         return (x + x[3]).std()
 
     gradf = jax.grad(foo, argnums=1)
     vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
 
     prng = jax.random.PRNGKey(42)
-    if n == 0:
+    if n == "f":
         f = foo
         args = (2.2, jax.random.normal(prng, (2, 5)))
-    else:
+    elif n == "vmapgradf":
         f = vmapgradf
         args = (2.2, jax.random.normal(prng, (3, 2, 5)))
+    else:
+        assert False, f"Unknown test {n}"
 
     print("f(args)=")
     print(f(*args))
@@ -653,7 +676,8 @@ def test_roundtrip(n):
         with open(fn, "w") as file:
             show_jaxpr(f, args, name=name, file=file, add_decls=True)
 
-        os.system(f"black -q -l 120 {fn}")
+        # os.system(f"black -q -l 120 {fn}")
+        os.system(f"sed -E 's/\\bv\\w+/v__/g' {fn} > {fn}.v__")
 
     # Save to file
     fn = "tmp/show_jaxpr_jaxpr.py"
@@ -671,11 +695,11 @@ def test_roundtrip(n):
 
     # Does it render the same?  Probably not, as nested calls have been optimized,
     # changing the results of uniquify_names, even with uniquify_names
-    os.system(f"diff {fn} {fn2}")
+    os.system(f"diff -yb -W120 {fn}.v__ {fn2}.v__")
 
     print(f"code --diff {fn} {fn2} # Do view diffs in vs code")
 
 
 if __name__ == "__main__":
-    test_roundtrip(0)
-    test_roundtrip(1)
+    test_roundtrip("f")
+    test_roundtrip("vmapgradf")

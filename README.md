@@ -64,7 +64,7 @@ def my_init() -> ParamsDict:
 
 # Show JAXPR
 
-A 'decompiler' for jaxprs back into python
+A 'decompiler' for jaxprs back into python.  Here's a python function (from `test_emit_readme`):
 ```python
 def ffn(W, x):
     ((W1,b1),(W2,b2)) = W
@@ -73,26 +73,29 @@ def ffn(W, x):
     y2 = W2 @ y1 + b2
     return jnn.softmax(y2)
 ```
-And the JAXPR, not super pretty, but perhaps more readable than the XLA, at least for python programmers
+And the output from `show_jaxpr(ffn, args)`, not super pretty, but 
+considerably more so than the jaxpr itself, or the XLA.
+We can see, for example, that the softmax
+primitive has been inlined into the jaxpr, having performed
+the typical `log(sum(exp(x - max(x))))` transformation.
 ```python
-# show_jaxpr | black
-def f22(v01, v02, v03, v04, v05):
+def ffn(v01, v02, v03, v04, v05):
     v06 = v01 @ v05
     v07 = v06 + v02
 
     def pjit_relu_0(v09):
-        return jnp.max(v09, np.array(0.0, dtype=np.float32))
-    v0c = custom_jvp_call_p.bind(v07, call_jaxpr=pjit_relu_0, jvp_jaxpr_fun='Wrapped function:\n\nCore: memoized\n', num_consts=0, symbolic_zeros=False)
+        return lax.max(v09, np.array(0.0, dtype=np.float32))
+    v0c = pjit_relu_0(v07)
     v0d = v03 @ v0c
     v0e = v0d + v04
     v0f = reduce_max_p.bind(v0e, axes=(0,))
-    v10 = jnp.max(np.array(-inf, dtype=np.float32), v0f)
-    v11 = lax.broadcast_in_dim(v10, shape=(1,), broadcast_dimensions=(), sharding=None)
-    v12 = stop_gradient_p.bind(v11)
+    v10 = lax.max(np.array(-inf, dtype=np.float32), v0f)
+    v11 = lax.broadcast_in_dim(v10, (1,), (), out_sharding=None)
+    v12 = lax.stop_gradient(v11)
     v13 = v0e - v12
     v14 = lax.exp(v13, accuracy=None)
     v15 = reduce_sum_p.bind(v14, axes=(0,))
-    v16 = lax.broadcast_in_dim(v15, shape=(1,), broadcast_dimensions=(), sharding=None)
+    v16 = lax.broadcast_in_dim(v15, (1,), (), out_sharding=None)
     v17 = v14 / v16
     return v17
 ```
