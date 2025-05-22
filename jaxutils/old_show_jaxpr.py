@@ -5,13 +5,11 @@ import numpy as np
 from functools import lru_cache
 
 import jax
-import jaxlib
 
 import jax._src as jaxsrc
 from jax.extend import core as jaxcore
 from jax._src import source_info_util as jaxsi
 
-import pytest
 
 def isJaxpr(x):
     return isinstance(x, (jaxcore.Jaxpr, jaxcore.ClosedJaxpr))
@@ -39,12 +37,6 @@ def intercommastr(*xs):
 
 def intercommavars(*xs):
     return ", ".join((varstr(x) for x in xs))
-
-
-def justone(iter):
-    l = list(iter)
-    assert len(l) == 1
-    return l[0]
 
 
 tab = "    "
@@ -454,90 +446,5 @@ def show_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
 
 
 def show_jaxpr_and_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
-    show_jaxpr(f, args, file=file, **kwargs)
+    old_show_jaxpr(f, args, file=file, **kwargs)
     show_xla(f, args, file=file, optimized=optimized, **kwargs)
-
-
-def test_basic():
-    def foo(p, x):
-        x = jax.numpy.matmul(x, p * x.T)
-        return (x + x[3]).std()
-
-    gradf = jax.grad(foo, argnums=1)
-    vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
-
-    f = vmapgradf
-
-    prng = jax.random.PRNGKey(42)
-    args = (2.2, jax.random.normal(prng, (3, 2, 5)))
-
-    print("f(args)=")
-    print(f(*args))
-
-    old_show_jaxpr(f, args, name="f")
-    # show_xla(f, args)
-    # show_xla(f, args, optimized=True)
-
-
-@pytest.mark.skip(reason="deprecating old_show_jaxpr")
-def test_roundtrip():
-    import os
-
-    def foo(p, x):
-        x = jax.numpy.matmul(x, p * x.T)
-        return (x + x[3]).std()
-
-    gradf = jax.grad(foo, argnums=1)
-    vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
-
-    f = vmapgradf
-
-    prng = jax.random.PRNGKey(42)
-    args = (2.2, jax.random.normal(prng, (3, 2, 5)))
-
-    print("f(args)=")
-    print(f(*args))
-
-    # Save to file
-    fn = "tmp/show_jaxpr_jaxpr.py"
-    with open(fn, "w") as file:
-        old_show_jaxpr(f, args, name="f", file=file, add_decls=True)
-
-    os.system(f"black {fn}")
-
-    # Load from file
-    import importlib.util
-
-    module_name = "show_jaxpr_roundtrip"
-    spec = importlib.util.spec_from_file_location(module_name, fn)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-
-    # Check rountrip: does module.f give the same result?
-    assert jnp.allclose(module.f(*args), f(*args))
-
-    # Save again
-    fn2 = "tmp/show_jaxpr_roundtrip.py"
-    with open(fn2, "w") as file2:
-        old_show_jaxpr(module.f, args, file=file2, add_decls=True)
-
-    os.system(f"black {fn2}")
-
-    # Reload for 2nd roundtrip to test string equality
-    module_name = "show_jaxpr_roundtrip2"
-    spec = importlib.util.spec_from_file_location(module_name, fn2)
-    module2 = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module2
-    spec.loader.exec_module(module2)
-
-    assert jnp.allclose(module.f(*args), f(*args))
-
-    # Sand save 2nd roundtrip
-    fn3 = "tmp/show_jaxpr_roundtrip2.py"
-    with open(fn3, "w") as file3:
-        old_show_jaxpr(module2.f, args, file=file3, add_decls=True)
-
-    os.system(f"black {fn3}")
-
-    print(f"code --diff {fn2} {fn3} # Do view diffs in vs code")

@@ -25,13 +25,11 @@ include = '\.pyi?$'
 minversion = "6.0"
 # addopts = "-ra -q"
 testpaths = [
-    ".",
+    "jaxutils",
+    "test"
 ]
 python_files = [
-    "vjp.py",
-    "show_jaxpr.py",
-    "expr.py",
-    "jaxpr_to_expr.py"
+    "*.py"
 ]
 
 [tool.setuptools]

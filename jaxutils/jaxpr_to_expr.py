@@ -2,7 +2,6 @@ import types
 import sys
 import re
 import numpy as np
-import itertools
 import functools
 
 from beartype.typing import Callable, Optional, Any, Dict, List
@@ -21,7 +20,19 @@ from jax.extend.core import primitives as jaxprim
 from pprint import pprint
 
 import jaxutils
-from jaxutils.expr import Expr, Var, Const, Lambda, Eqn, Let, Call, mkTuple, isNone
+from jaxutils.expr import (
+    Expr,
+    Var,
+    Const,
+    Lambda,
+    Eqn,
+    Let,
+    Call,
+    mkTuple,
+    isNone,
+    kwargs_to_dict_call,
+    new_call,
+)
 
 from jaxutils.expr import (
     dictassign,
@@ -38,21 +49,6 @@ else:
     import astunparse
 
     unparse = astunparse.unparse
-
-
-def kwargs_to_dict_call(dict):
-    if not dict:
-        return []
-
-    dict_pairs = [[Const(key), val] for key, val in dict.items()]
-    return [Call(Var("**_pairs_to_dict"), list(itertools.chain(*dict_pairs)))]
-
-
-def new_call(fn: str, *args, **kwargs):
-    """
-    Convenience function to make a Call node from a string, args, and kwargs
-    """
-    return Call(Var(fn), list(args) + kwargs_to_dict_call(kwargs))
 
 
 _prim_to_expr: Dict[jaxcore.Primitive, Callable[..., Optional[Expr]]] = {}
@@ -382,19 +378,6 @@ def jaxpr_to_expr_aux(x) -> Expr:
     assert False, f"Check {type(x)} shouldn't be transformed [{repr(x)}]"
 
 
-import inspect
-
-
-def _pairs_to_dict(*pairs):
-    it = iter(pairs)
-    return {a: b for (a, b) in zip(it, it)}
-
-
-def test__pairs_to_dict():
-    assert _pairs_to_dict("a", 2, "b", 3) == {"a": 2, "b": 3}
-    assert _pairs_to_dict() == {}
-
-
 def show_jaxpr(
     f,
     args,
@@ -469,7 +452,7 @@ from jax.extend.core.primitives import (
    add_jaxvals_p
 )
 
-g_tuple = lambda *a: tuple(a)
+from jaxutils.expr_lib import *
 """,
             file=file,
         )
@@ -569,137 +552,3 @@ if __name__ == '__main__':
 
     if our_file:
         our_file.close()
-
-
-def test_basic():
-    def foo(p, x):
-        return (x + x[3]).std()
-
-    gradf = jax.grad(foo, argnums=1)
-
-    prng = jax.random.PRNGKey(42)
-    args = (2.2, jax.random.normal(prng, (2, 5)))
-
-    print("f(args)=")
-    print(gradf(*args))
-
-    show_jaxpr(gradf, args, name="gradf")
-
-    # pjit not supported on JaxDecompiler
-    # from JaxDecompiler import decompiler
-
-    # decompiled_f, python_code = decompiler.python_jaxpr_python(
-    #     gradf, args, is_python_returned=True
-    # )
-    # print(python_code)
-
-
-def test_emit_readme():
-    def ffn(W, x):
-        ((W1, b1), (W2, b2)) = W
-        t1 = W1 @ x + b1
-        y1 = jax.nn.relu(t1)
-        y2 = W2 @ y1 + b2
-        return jax.nn.softmax(y2)
-
-    W = (
-        (np.random.rand(11, 7), np.random.rand(11)),
-        (np.random.rand(10, 11), np.random.rand(10)),
-    )
-    x = np.random.rand(7)
-
-    show_jaxpr(ffn, (W, x))
-
-    show_jaxpr(jax.grad(lambda W, x: -jnp.log(ffn(W, x)[5])), (W, x))
-
-
-def test_vmap():
-    def foo(p, x):
-        x = x @ (p * x.T)
-        return (x + x[3]).std()
-
-    gradf = jax.grad(foo, argnums=1)
-    vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
-
-    prng = jax.random.PRNGKey(42)
-    args = (2.2, jax.random.normal(prng, (2, 5)))
-    vargs = (2.2, jax.random.normal(prng, (3, 2, 5)))
-
-    print("foo(args)=")
-    print(foo(*args))
-
-    show_jaxpr(foo, args, name="f")
-
-    show_jaxpr(vmapgradf, vargs, name="vmapgradf")
-
-
-import importlib.util
-
-
-def load_module(filename, module_name):
-    spec = importlib.util.spec_from_file_location(module_name, filename)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.mark.parametrize("n", ("f", "vmapgradf"))
-def test_roundtrip(n):
-    import os
-
-    def foo(p, x):
-        x = jax.numpy.matmul(x, p * x.T)
-        x = jax.nn.relu(x)
-        x = jax.nn.softmax(x)
-        return (x + x[3]).std()
-
-    gradf = jax.grad(foo, argnums=1)
-    vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
-
-    prng = jax.random.PRNGKey(42)
-    if n == "f":
-        f = foo
-        args = (2.2, jax.random.normal(prng, (2, 5)))
-    elif n == "vmapgradf":
-        f = vmapgradf
-        args = (2.2, jax.random.normal(prng, (3, 2, 5)))
-    else:
-        assert False, f"Unknown test {n}"
-
-    print("f(args)=")
-    print(f(*args))
-
-    def save(f, args, name, fn):
-        jaxutils.expr.reset_new_name_ids()
-
-        with open(fn, "w") as file:
-            show_jaxpr(f, args, name=name, file=file, add_decls=True)
-
-        # os.system(f"black -q -l 120 {fn}")
-        os.system(f"sed -E 's/\\bv\\w+/v__/g' {fn} > {fn}.v__")
-
-    # Save to file
-    fn = "tmp/show_jaxpr_jaxpr.py"
-    save(f, args, "f", fn)
-
-    # Load from file
-    module = load_module(fn, "show_jaxpr_roundtrip")
-
-    # Check roundtrip: does module.f give the same result?
-    assert jnp.allclose(module.f(*args), f(*args))
-
-    # Save again
-    fn2 = "tmp/show_jaxpr_roundtrip.py"
-    save(module.f, args, "f", fn2)
-
-    # Does it render the same?  Probably not, as nested calls have been optimized,
-    # changing the results of uniquify_names, even with uniquify_names
-    os.system(f"diff -yb -W120 {fn}.v__ {fn2}.v__")
-
-    print(f"code --diff {fn} {fn2} # Do view diffs in vs code")
-
-
-if __name__ == "__main__":
-    test_roundtrip("f")
-    test_roundtrip("vmapgradf")

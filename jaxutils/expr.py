@@ -5,6 +5,9 @@ from beartype import beartype
 from beartype.typing import List, Set, Any, Tuple, Dict, List, Callable, Optional
 from pprint import pprint
 from itertools import chain
+from more_itertools import one
+from jaxutils import ast_utils, expr_lib
+
 import operator
 
 import ast
@@ -62,27 +65,6 @@ def dictassign(d: Dict[Any, Callable], key: Any):
     return wrapper
 
 
-def all_equal(xs, ys):
-    if len(xs) != len(ys):
-        return False
-    for x, y in zip(xs, ys):
-        if x != y:
-            return False
-    return True
-
-
-def test_all_equal():
-    xs = [1, 2, 3]
-    ys = [1, 2]
-    assert not all_equal(xs, ys)
-    assert not all_equal([], ys)
-    assert not all_equal(xs, [])
-    assert all_equal(ys, ys)
-    assert all_equal(xs, xs)
-
-
-test_all_equal()
-
 ### New name factory
 
 _expr_global_name_id = 0
@@ -116,6 +98,7 @@ def reset_new_name_ids():
 #                           88
 #                           88
 ########################################################################################
+
 
 @beartype
 class Expr:
@@ -241,68 +224,41 @@ def transform_postorder(transformer: Callable[[Expr], Expr], e: Expr = None):
 
 
 def freevars(e: Expr) -> Set[Var]:
+    return freevars_aux(e, set())
+
+
+@beartype
+def freevars_aux(e: Expr, bound_vars: Set[Var]) -> Set[Var]:
     if e.isConst:
         return set()
 
     if e.isVar:
-        return {e}
+        if e in bound_vars:
+            return set()
+        else:
+            return {e}
 
     if e.isLet:
-        bound_vars = set()
-        fv_vals = set()
+        let_bound_vars = set() | bound_vars
+        fvs = set()
         for eqn in e.eqns:
-            fv_vals |= set.difference(freevars(eqn.val), bound_vars)
-            bound_vars = set.union(bound_vars, set(eqn.vars))
-        fv_body = set.difference(freevars(e.body), bound_vars)
-        return set.union(fv_vals, fv_body)
+            fv_val = freevars_aux(eqn.val, let_bound_vars)
+            fvs |= fv_val
+            let_bound_vars |= set(eqn.vars)
+        fv_body = freevars_aux(e.body, let_bound_vars)
+        return fvs | fv_body
 
     if e.isLambda:
-        return set.difference(freevars(e.body), e.args)
+        inner_bound_vars = set(e.args) | bound_vars
+        return freevars_aux(e.body, inner_bound_vars)
 
     if e.isCall:
-        return set.union(freevars(e.f), *(freevars(arg) for arg in e.args))
+        return set.union(
+            freevars_aux(e.f, bound_vars),
+            *(freevars_aux(arg, bound_vars) for arg in e.args),
+        )
 
     assert False
-
-
-def _make_e():
-    # Make an expr for testing
-    import math
-
-    foo, w, x, y, z = mkvars("foo, w, x, y, z")
-    v_sin, v_add, v_mul = mkvars("sin, add, mul")
-
-    a_lam = Lambda([z], Call(v_sin, [z]))
-    call_lam = Call(a_lam, [x])
-    foo_lam = Lambda(
-        [x, y],
-        Let(
-            [
-                Eqn([w], Call(v_add, [x, Const(3.3)])),
-                Eqn([z], Call(v_add, [x, w])),
-            ],
-            Call(v_mul, [call_lam, y]),
-        ),
-    )
-    e = Let(
-        [
-            Eqn([foo], foo_lam),
-        ],
-        Call(foo, [Const(1.1), Const(2.2)]),
-    )
-    return e
-
-
-def test_basic():
-    foo, x, y, z = mkvars("foo, x, y, z")
-    v_sin, v_add, v_mul = mkvars("sin, add, mul")
-
-    e = _make_e()
-
-    pprint(e)
-    assert freevars(e) == {v_sin, v_add, v_mul}
-    assert freevars(e.eqns[0].val) == {v_sin, v_add, v_mul}
-    assert freevars(e.eqns[0].val.body) == {x, y, v_sin, v_add, v_mul}
 
 
 def preorder_visit(e: Expr, f: Callable[[Expr], Any]):
@@ -323,21 +279,44 @@ def preorder_visit(e: Expr, f: Callable[[Expr], Any]):
         for arg in e.args:
             yield from preorder_visit(arg, f)
 
-def test_visit():
-    e = _make_e()
-    preorder_visit(e, lambda x: print(type(x)))
-
 
 ### Global functions
-g_tuple = Var("g_tuple")
-g_identity = Var("g_identity")
+
+
+def is_global_function_name(name):
+    """
+    Check if a variable is a global function name
+    """
+    if name.startswith("g_"):
+        return True
+    if name.startswith("operator."):
+        return True
+    if name in ("getattr", "**g_pairs_to_dict"):
+        return True
+
+    return False
 
 
 def mkTuple(es: List[Expr]) -> Expr:
     if len(es) == 1:
         return es[0]
     else:
-        return Call(g_tuple, es)
+        return Call(Var("g_tuple"), es)
+
+
+def kwargs_to_dict_call(dict):
+    if not dict:
+        return []
+
+    dict_pairs = [[Const(key), val] for key, val in dict.items()]
+    return [Call(Var("**g_pairs_to_dict"), list(chain(*dict_pairs)))]
+
+
+def new_call(fn: str, *args, **kwargs):
+    """
+    Convenience function to make a Call node from a string, args, and kwargs
+    """
+    return Call(Var(fn), list(args) + kwargs_to_dict_call(kwargs))
 
 
 ########################################################################################
@@ -369,7 +348,7 @@ def signature(e):
     functions being called...
     """
     fvs = {v.name for v in freevars(e)}
-    return set.union(fvs, {g_tuple.name, g_identity.name})
+    return set.union(fvs, {Var("g_tuple").name, Var("g_identity").name})
 
 
 def optimize(e: Expr) -> Expr:
@@ -453,7 +432,7 @@ def inline_lambda_of_call(e: Expr) -> Expr:
     # Lambda(args, Call(f, args)) -> f
     if e.isLambda:
         if e.body.isCall:
-            if all_equal(e.body.args, e.args):
+            if e.body.args == e.args:
                 return e.body.f
 
 
@@ -470,7 +449,7 @@ def detuple_tuple_assignments(e: Expr) -> Expr:
     def detuple_eqn(eqn):
         vars = eqn.vars
         val = eqn.val
-        if len(vars) > 1 and val.isCall and val.f == g_tuple:
+        if len(vars) > 1 and val.isCall and val.f == Var("g_tuple"):
             for var, arg in zip(vars, val.args):
                 yield Eqn([var], arg)
         else:
@@ -478,6 +457,7 @@ def detuple_tuple_assignments(e: Expr) -> Expr:
 
     new_eqns = list(chain(*map(detuple_eqn, e.eqns)))
     return Let(new_eqns, e.body)
+
 
 # from collections import Counter
 
@@ -656,12 +636,6 @@ def let_to_lambda(e: Expr) -> Expr:
         return Call(Lambda(args, body), vals)
 
 
-def test_let_to_lambda():
-    e = from_ast(ast.parse("let x = 2, y = 3 in x + y"))
-    l = transform_postorder(let_to_lambda, e)
-    assert l.isCall and l.f.isLambda and len(l.args) == 2
-
-
 def elide_empty_lhs(e: Expr) -> Expr:
     """
     let [] = val1, x2 = val2 in body
@@ -698,25 +672,15 @@ def identify_identities(e: Expr) -> Expr:
     lambda x: x -> g_identity
     """
     if e.isLambda and [e.body] == e.args:
-        return g_identity
+        return Var("g_identity")
 
 
 def eliminate_identities(e: Expr) -> Expr:
     """
     g_identity(args) -> args
     """
-    if e.isCall and e.f == g_identity:
+    if e.isCall and e.f == Var("g_identity"):
         return mkTuple(e.args)
-
-
-def test_let_to_lambda():
-    e = _make_e()
-    l = transform_postorder(let_to_lambda, e)
-
-    def check(e):
-        assert not e.isLet
-
-    preorder_visit(l, check)
 
 
 def uniquify_names(e: Expr, reset_ids: bool = False) -> Expr:
@@ -832,19 +796,37 @@ def test_uniquify_names():
 #
 ########################################################################################
 
-def run_eval(e: Expr, bindings: Dict[str, Any]) -> Any:
+
+def eval_expr(e: Expr, args, bindings=None):
+    bindings = {} if bindings is None else bindings
+    bindings |= _bindings_for_operators()
+    bindings |= _bindings_for_expr_lib()
+    return _run_eval(Call(e, [Const(a) for a in args]), bindings)
+
+
+def _bindings_for_operators():
+    ops = {("operator." + op): operator.__dict__[op] for op in _ast_ops.keys()}
+    ops["getattr"] = getattr
+    return ops
+
+
+def _bindings_for_expr_lib():
+    return {f: getattr(expr_lib, f) for f in dir(expr_lib)}
+
+
+def _run_eval(e: Expr, bindings: Dict[str, Any]) -> Any:
     new_bindings = {Var(key): val for key, val in bindings.items()}
     # Check all the freevars have been bound
     unbound_vars = [v.name for v in set(freevars(e)) - set(new_bindings)]
     if len(unbound_vars) > 0:
         raise ValueError(f"Unbound variable(s): {','.join(unbound_vars)}")
 
-    return run_eval_aux(e, new_bindings)
+    return _run_eval_aux(e, new_bindings)
 
 
 @beartype
-def run_eval_aux(e: Expr, bindings: Dict[Var, Any]) -> Any:
-    recurse = run_eval_aux
+def _run_eval_aux(e: Expr, bindings: Dict[Var, Any]) -> Any:
+    recurse = _run_eval_aux
 
     if e.isConst:
         return e.val
@@ -896,31 +878,6 @@ def run_eval_aux(e: Expr, bindings: Dict[Var, Any]) -> Any:
         return lambda *vals: runLambda(e, vals, bindings)
 
     assert False
-
-
-def test_eval():
-
-    a, b, c = mkvars("a,b,c")
-    f_tuple, f_add = mkvars("tuple, add")
-    f_defs = {
-        "add": operator.add,
-        "tuple": lambda *args: tuple(args),
-        "getattr": getattr,
-    }
-
-    v = run_eval(Call(f_add, [Const(2), Const(3)]), f_defs)
-    assert v == 5
-
-    v = run_eval(
-        Let(
-            [
-                Eqn([a, b], Call(f_tuple, [Const(2), Const(3)])),
-            ],
-            Call(f_add, [a, b]),
-        ),
-        f_defs,
-    )
-    assert v == 5
 
 
 ########################################################################################
@@ -993,7 +950,15 @@ _ast_ops = _ast_cmpops | _ast_binops | _ast_unaryops
 _ast_op_to_operator = {v: k for k, v in _ast_ops.items()}
 
 
+def _ast_op_to_Var(op):
+    if op in _ast_op_to_operator:
+        return Var("operator." + _ast_op_to_operator[op])
+    else:
+        raise ValueError(f"Unknown operator {op}")
+
+
 lambda_to_name = {}
+
 
 def to_ast(e, name):
     e = uniquify_names(e)
@@ -1101,8 +1066,7 @@ def to_ast_aux(e, assignments, binders=None):
         if binders is None:
             v = Var("f" + get_new_name())
         else:
-            assert len(binders) == 1
-            v = binders[0]
+            v = one(binders)
 
         # Recurse, generating inner assignments
         inner_assignments = []
@@ -1127,8 +1091,8 @@ def to_ast_aux(e, assignments, binders=None):
             return None
 
     if e.isCall:
-        # Special case: **_pairs_to_dict
-        if e.f.isVar and e.f.name == "**_pairs_to_dict":
+        # Special case: **g_pairs_to_dict
+        if e.f.isVar and e.f.name == "**g_pairs_to_dict":
             # convert to dict call
             keywords = [
                 ast.keyword(arg=k.val, value=to_ast_aux(value, assignments))
@@ -1168,27 +1132,6 @@ def to_ast_aux(e, assignments, binders=None):
     assert False
 
 
-def test_ast():
-    a, b, c = mkvars("a,b, c")
-    e = Let(
-        [
-            Eqn([a, b], Const(123)),
-            Eqn([c], Call(Var("add"), [a, b])),
-        ],
-        Const(234),
-    )
-    pprint(e)
-    a = to_ast(e, "e")
-    print(astunparse.unparse(a))
-
-    e = _make_e()
-    a = to_ast(e, "e")
-    print(astunparse.unparse(a))
-
-    # code = compile(a, 'bar', 'exec')
-    # exec(code)
-
-
 ########################################################################################
 #
 #
@@ -1205,47 +1148,44 @@ def test_ast():
 ########################################################################################
 
 
-def from_ast(a: ast.AST):
-    recurse = from_ast
+def _ast_shortstr(a):
+    if a is None:
+        return ""
+
+    if isinstance(a, ast.FunctionDef):
+        return f"def[{a.name}]"
+
+    return type(a).__name__
+
+
+def _ast_error(msg, path):
+    loc = "/".join(map(_ast_shortstr, path))
+    raise ValueError(f"{loc}: {msg}")
+
+
+@beartype
+def ast_to_expr(a: Optional[ast.AST], path_to_a: List[Optional[ast.AST]]):
+    recurse = lambda sub_expr: ast_to_expr(sub_expr, path_to_a + [a])
+    err = lambda msg: _ast_error(msg, path_to_a)
+    ast_to_eqn = lambda stmt: _ast_to_eqn(stmt, path_to_a + [a])
 
     if isinstance(a, ast.Module):
-        assert len(a.body) == 1
-        return recurse(a.body[0])
+        return recurse(one(a.body))
 
     if isinstance(a, ast.arguments):
         assert not a.vararg
         assert not a.kwonlyargs
         assert not a.kw_defaults
         assert not a.kwarg
-        assert not a.defaults
+        assert not a.defaults, err("Default arguments not implemented")
         if sys.version_info >= (3, 8):
             assert not a.posonlyargs
 
         return [Var(arg.arg) for arg in a.args]
 
     if isinstance(a, ast.FunctionDef):
-        name = Var(a.name)
-        args = recurse(a.args)
-
-        eqns = []
-        for stmt in a.body[:-1]:
-            assert isinstance(stmt, ast.Assign)
-            assert len(stmt.targets) == 1
-            s_vars = stmt.targets[0]
-            if isinstance(s_vars, ast.Tuple):
-                vars = [Var(var.id) for var in s_vars.elts]
-            else:
-                vars = [Var(s_vars.id)]
-            val = recurse(stmt.value)
-            eqns += [Eqn(vars, val)]
-
-        assert isinstance(a.body[-1], ast.Return)
-        retval = recurse(a.body[-1].value)
-
-        body = Let(eqns, retval)
-        lam = Lambda(args, body)
-
-        return Let([Eqn([name], lam)], name)
+        eqn = ast_to_eqn(a)
+        return Let([eqn], mkTuple(eqn.vars))
 
     if isinstance(a, ast.Lambda):
         return Lambda(recurse(a.args), recurse(a.body))
@@ -1253,12 +1193,12 @@ def from_ast(a: ast.AST):
     if isinstance(a, ast.Constant):
         return Const(a.value)
 
+    if a is None:
+        return Const(None)
+
     # Nodes which encode to Var
     if isinstance(a, ast.Name):
         return Var(a.id)
-
-    # if isinstance(a, ast.operator):
-    #     return Var("ast." + type(a).__name__)
 
     # Nodes which encode to (Var or Call)
     if isinstance(a, ast.Attribute):
@@ -1274,85 +1214,113 @@ def from_ast(a: ast.AST):
     if isinstance(a, ast.Call):
         func = recurse(a.func)
         args = [recurse(arg) for arg in a.args]
-        assert len(a.keywords) == 0
-        return Call(func, args)
+        kwargs = {kw.arg: recurse(kw.value) for kw in a.keywords}
+        return Call(func, args + kwargs_to_dict_call(kwargs))
 
     if isinstance(a, ast.Tuple):
-        return Call(g_tuple, [recurse(e) for e in a.elts])
+        return Call(Var("g_tuple"), [recurse(e) for e in a.elts])
 
     if isinstance(a, ast.BinOp):
-        operator_op = _ast_op_to_operator[type(a.op)]  # check that op is in the dict
-        op = Var("operator." + operator_op)
+        op = _ast_op_to_Var(type(a.op))
         return Call(op, [recurse(a.left), recurse(a.right)])
 
+    if isinstance(a, ast.UnaryOp):
+        op = _ast_op_to_Var(type(a.op))
+        return Call(op, [recurse(a.operand)])
+
     if isinstance(a, ast.Subscript):
-        return Call(Var("ast.Subscript"), [recurse(a.value), recurse(a.slice)])
+        return Call(Var("g_subscript"), [recurse(a.value), recurse(a.slice)])
+
+    if isinstance(a, ast.Slice):
+        return Call(
+            Var("g_slice"), [recurse(a.lower), recurse(a.upper), recurse(a.step)]
+        )
 
     if isinstance(a, ast.Index):
         return recurse(a.value)
 
-    if isinstance(a, (ast.ExtSlice, ast.Slice)):
-        # Plan is to overload "ast.Subscript" implementation to handle them all.
-        assert False
+    if isinstance(a, ast.List):
+        return Call(Var("g_list"), [recurse(elt) for elt in a.elts])
+
+    if isinstance(a, ast.Expr):
+        return recurse(a.value)
 
     # Fallthru
     assert False, f"TODO:{type(a)}"
 
 
-def test_ast_to_expr():
-    import jax.numpy as jnp
+def _ast_to_eqn(stmt, path_to_a):
+    recurse = lambda sub_expr: ast_to_expr(sub_expr, path_to_a + [stmt])
+    err = lambda msg: _ast_error(msg, path_to_a)
+    ast_to_eqn = lambda stmt: _ast_to_eqn(stmt, path_to_a + [stmt])
 
-    def foo(f):
-        a, b = 123, 2
-        c = f * b
-        d = jnp.sin(c)
-        return (lambda x: d + x)(c)
+    if isinstance(stmt, ast.FunctionDef):
+        args = recurse(stmt.args)
 
-    expected = foo(5)
+        eqns = [ast_to_eqn(a) for a in stmt.body[:-1]]
 
-    e = expr_for(foo)
-    print(expr_to_python_code(e, "foo"))
+        assert isinstance(stmt.body[-1], ast.Return)
+        retval = recurse(stmt.body[-1].value)
 
-    got = eval_expr(
-        e,
-        [5],
-        {
-            "g_tuple": lambda *args: tuple(args),
-            "getattr": getattr,
-            "jnp": jnp,
-        },
-    )
-    assert expected == got
+        body = Let(eqns, retval)
+        lam = Lambda(args, body)
+        return Eqn([Var(stmt.name)], lam)
 
+    if isinstance(stmt, ast.Assign):
+        val = recurse(stmt.value)
+        s_vars = one(stmt.targets)  # TODO: tuple of tuple
+        if isinstance(s_vars, ast.Tuple):
+            vars = [Var(var.id) for var in s_vars.elts]
+            if len(vars) == 1:
+                # This is a 1-var detuple - we don't represent it specially,
+                # so pull the value off the tuple
+                val = Call(Var("g_fst"), [val])
+        else:
+            vars = [Var(s_vars.id)]
+        return Eqn(vars, val)
 
-def test_ast_to_expr2():
-    import jax
+    if isinstance(stmt, ast.AugAssign):
+        var = Var(stmt.target.id)
+        val = recurse(stmt.value)
+        val = Call(_ast_op_to_Var(type(stmt.op)), [var, val])
+        return Eqn([var], val)
 
-    def foo(p, x):
-        x = x @ (p * x.T)
-        return (x + x[3]).std()
+    if isinstance(stmt, ast.Expr):
+        var = Var("_" + get_new_name())
+        return Eqn([var], recurse(stmt.value))
 
-    prng = jax.random.PRNGKey(42)
-    args = (2.2, jax.random.normal(prng, (2, 5)))
+    if isinstance(stmt, ast.For):
+        assert not stmt.orelse
+        assert not stmt.type_comment
+        target = Var(stmt.target.id)
+        iter = recurse(stmt.iter)
+        body_eqns = [ast_to_eqn(stmt) for stmt in stmt.body]
 
-    expected = foo(*args)
-    print(expected)
+        print(ast.unparse(stmt))
+        analyzer = ast_utils.FreeVarAnalyzer()
+        for body_stmt in stmt.body:
+            analyzer.visit(body_stmt)
+            # print(ast.unparse(body_stmt))
+        # print(one(analyzer.bound_stack), "<-", analyzer.free)
+        iteration_var_names = one(analyzer.bound_stack) & analyzer.free
+        iteration_vars = [Var(name) for name in iteration_var_names]
 
-    e_foo = expr_for(foo)
-    print(expr_to_python_code(e_foo, "foo"))
+        # Scan a function over leading array axes while carrying along state.
+        # scan(f, init, xs=None, length=None, reverse=False)
+        init = one(iteration_vars)
+        xs = iter
+        scan_lambda = Lambda(
+            iteration_vars + [target],
+            Let(body_eqns, one(iteration_vars)),
+        )
 
-    got = eval_expr(
-        e_foo,
-        args,
-        {
-            "ast.Subscript": lambda a, slice: a[slice],
-            "ast.MatMult": operator.matmul,
-            "ast.Mult": operator.mul,
-            "ast.Add": operator.add,
-            "tuple": lambda *args: tuple(args),
-            "getattr": getattr,
-        },
-    )
+        val = Call(Var("g_scan"), [scan_lambda, init, xs])
+        var = one(iteration_vars)
+        print(expr_to_python_code(val, var.name))
+        return Eqn(iteration_vars, val)
+
+    print(ast.dump(stmt))
+    assert False, f"Unknown statement {stmt}"
 
 
 #### Misc
@@ -1363,18 +1331,9 @@ def expr_for(f: Callable) -> Expr:
     import textwrap
 
     a = ast.parse(textwrap.dedent(inspect.getsource(f)))
-    return from_ast(a)
+    return ast_to_expr(a, [])
 
 
 def expr_to_python_code(e: Expr, name: str) -> str:
     as_ast = to_ast(e, name)
     return astunparse.unparse(as_ast)
-
-
-def bindings_for_operators():
-    return {("operator." + op): operator.__dict__[op] for op in _ast_ops.keys()}
-
-
-def eval_expr(e: Expr, args, bindings):
-    bindings |= bindings_for_operators()
-    return run_eval(Call(e, [Const(a) for a in args]), bindings)

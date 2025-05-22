@@ -6,3 +6,4 @@ pytest
 black
 astunparse
 beartype
+more_itertools
