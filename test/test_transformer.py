@@ -1,13 +1,11 @@
-"""
-Pure-from-the-ground-up transformer, based on https://github.com/vpj/jax_transformer/blob/master/transformer.py
-"""
-
 import jax
 import jax.numpy as jnp
-
 import numpy as np
 
 from jaxutils.ParamsDict import ParamsDict
+
+
+# Frozen copy of https://github.com/awf/functional-transformer
 
 
 def matrix_init_uniform(in_features: int, out_features: int):
@@ -165,7 +163,7 @@ def seq_crossentropy(output: jnp.ndarray, targets: jnp.ndarray):
     return jax.vmap(crossentropy)(output, targets).mean()
 
 
-def transformer_loss(cfg, params, x, transformer):
+def transformer_loss(cfg, params, x, transformer_callable):
     """
     # Transformer loss for one example
 
@@ -173,7 +171,7 @@ def transformer_loss(cfg, params, x, transformer):
     params: Current transformer parameters, initialized in init
     x: 1D array of integers, representing the input sequence
     """
-    output = transformer(cfg, params, x)
+    output = transformer_callable(cfg, params, x)
 
     return seq_crossentropy(output[:-1], x[1:])
 
@@ -224,25 +222,27 @@ import jax.numpy as jnp
         fvs = {"transformer"}
         while fvs:
             vname = fvs.pop()
-            if vname in globals():
-                v = globals()[vname]
-                if isinstance(v, types.ModuleType):
-                    # Skip modules
-                    if v.__name__ == vname:
-                        print(f"import {v.__name__}")
-                    else:
-                        print(f"import {v.__name__} as {vname}")
-                    continue
-                if vname in dir(jaxutils.expr_lib):
-                    # Skip jaxutils.expr_lib
-                    continue
-
-                print(f"Free var {vname} in globals, not skipped")
-                e = expr_for(v)
-                print(expr_to_python_code(e, vname), file=f)
-                fvs |= {v.name for v in freevars(e)}
-            else:
+            if vname not in globals():
                 print(f"Free var {vname} not in globals")
+                continue
+
+            v = globals()[vname]
+            if isinstance(v, types.ModuleType):
+                # Skip modules
+                if v.__name__ == vname:
+                    print(f"import {v.__name__}")
+                else:
+                    print(f"import {v.__name__} as {vname}")
+                continue
+
+            if vname in dir(jaxutils.expr_lib):
+                # Skip names in jaxutils.expr_lib
+                continue
+
+            print(f"Free var {vname} in globals, generating code")
+            e = expr_for(v)
+            print(expr_to_python_code(e, vname), "\n\n", file=f)
+            fvs |= {v.name for v in freevars(e)}
 
     from awfutils import import_from_file
 

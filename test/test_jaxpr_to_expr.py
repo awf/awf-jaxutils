@@ -33,25 +33,6 @@ def test_basic():
     # print(python_code)
 
 
-def test_emit_readme():
-    def ffn(W, x):
-        ((W1, b1), (W2, b2)) = W
-        t1 = W1 @ x + b1
-        y1 = jax.nn.relu(t1)
-        y2 = W2 @ y1 + b2
-        return jax.nn.softmax(y2)
-
-    W = (
-        (np.random.rand(11, 7), np.random.rand(11)),
-        (np.random.rand(10, 11), np.random.rand(10)),
-    )
-    x = np.random.rand(7)
-
-    show_jaxpr(ffn, (W, x))
-
-    show_jaxpr(jax.grad(lambda W, x: -jnp.log(ffn(W, x)[5])), (W, x))
-
-
 def test_vmap():
     def foo(p, x):
         x = x @ (p * x.T)

@@ -73,7 +73,7 @@ _expr_global_name_id = 0
 def get_new_name():
     global _expr_global_name_id
     _expr_global_name_id += 1
-    return f"{_expr_global_name_id:02d}"
+    return f"{_expr_global_name_id:02x}"
 
 
 def reset_new_name_ids():
@@ -436,6 +436,160 @@ def inline_lambda_of_call(e: Expr) -> Expr:
                 return e.body.f
 
 
+from collections import defaultdict
+
+
+def compute_variable_use_counts(e: Expr) -> Expr:
+
+    var_to_count: Dict[str, int] = defaultdict(lambda: 0)
+
+    def doit(e: Expr) -> Expr:
+        if e.isConst:
+            pass
+
+        elif e.isVar:
+            var_to_count[e.name] += 1
+
+        elif e.isLet:
+            for eqn in e.eqns:
+                assert all(var.name not in var_to_count for var in eqn.vars)
+            for eqn in e.eqns:
+                doit(eqn.val)
+            doit(e.body)
+
+        elif e.isLambda:
+            for arg in e.args:
+                assert arg.name not in var_to_count
+            doit(e.body)
+
+        elif e.isCall:
+            doit(e.f)
+            for arg in e.args:
+                doit(arg)
+        else:
+            assert False
+
+    doit(e)
+
+    return var_to_count
+
+
+def inline_trivial_rhs(e: Expr) -> Expr:
+    # let
+    #   v1 = e1
+    #   v2 = e2
+    # in
+    #   body
+    var_to_count = compute_variable_use_counts(e)
+
+    def recurse(e, var_to_val):
+        if e.isConst:
+            return e
+
+        if e.isVar:
+            if var_to_count[e.name] == 1 and e.name in var_to_val:
+                return var_to_val[e.name]
+            else:
+                return e
+
+        if e.isLet:
+            inner_var_to_val = {**var_to_val}
+            eqns = []
+            for eqn in e.eqns:
+                val = recurse(eqn.val, inner_var_to_val)
+                inner_var_to_val[one(eqn.vars).name] = val
+                eqns += [Eqn(eqn.vars, val)]
+
+            body = recurse(e.body, inner_var_to_val)
+            return Let(eqns, body)
+
+        if e.isCall:
+            f = recurse(e.f, var_to_val)
+            args = [recurse(a, var_to_val) for a in e.args]
+            return Call(f, args)
+
+        if e.isLambda:
+            inner_var_to_val = {**var_to_val}
+            for arg in e.args:
+                inner_var_to_val[arg.name] = arg
+            body = recurse(e.body, inner_var_to_val)
+            return Lambda(e.args, body)
+
+        assert False
+
+    return recurse(e, {})
+
+
+def dce(e: Expr) -> Expr:
+    e = uniquify_names(e)
+    var_to_count = compute_variable_use_counts(e)
+
+    def recurse(e):
+        if e.isConst:
+            return e
+
+        if e.isVar:
+            return e
+
+        if e.isLet:
+            eqns = []
+            for eqn in e.eqns:
+                val = recurse(eqn.val)
+                var = one(eqn.vars)
+                if var_to_count[var.name] > 0:
+                    eqns += [Eqn(eqn.vars, val)]
+
+            body = recurse(e.body)
+            return Let(eqns, body)
+
+        if e.isCall:
+            f = recurse(e.f)
+            args = [recurse(a) for a in e.args]
+            return Call(f, args)
+
+        if e.isLambda:
+            body = recurse(e.body)
+            return Lambda(e.args, body)
+
+        assert False
+
+    return recurse(e)
+
+
+def detuple_lets(e: Expr) -> Expr:
+    # Let([Eqn([a, b, c], v),
+    #       body) ->
+    #  Let([Eqn(t, v)
+    #     Eqn(a, t[0]),
+    #       Eqn(b, t[1]),
+    #       Eqn(c, t[2])],
+    #           body)))
+
+    def doit(e):
+        if not e.isLet:
+            return e
+
+        def detuple_eqn(eqn):
+            vars = eqn.vars
+            val = eqn.val
+            if len(vars) > 1:
+                if val.isVar:
+                    tupvar = val
+                else:
+                    tupvar = Var("tup_" + get_new_name())
+                    yield Eqn([[tupvar, val]])
+
+                for i, var in enumerate(vars):
+                    yield Eqn([var], Call(Var("g_subscript"), [tupvar, Const(i)]))
+            else:
+                yield Eqn(vars, val)
+
+        new_eqns = list(chain(*map(detuple_eqn, e.eqns)))
+        return Let(new_eqns, e.body)
+
+    return transform_postorder(doit, e)
+
+
 def detuple_tuple_assignments(e: Expr) -> Expr:
     # Let([Eqn([a, b, c], Call(tuple, [aprime, bprime, cprime]))],
     #       body) ->
@@ -686,76 +840,79 @@ def eliminate_identities(e: Expr) -> Expr:
 def uniquify_names(e: Expr, reset_ids: bool = False) -> Expr:
     if reset_ids:
         reset_new_name_ids()
+
     # To start with, add freevars to scope, with their own names
     translations = {v.name: v.name for v in freevars(e)}
-    return uniquify_names_aux(e, translations)
+    all_names = set(translations.keys())
 
+    def make_new(name):
+        newname = name
+        i = 0
+        while newname in all_names:
+            newname = name + f"_{i}"
+            i += 1
+        all_names.add(newname)
+        return newname
 
-def uniquify_names_aux(e: Expr, translations) -> Expr:
-    # foo(let x = 2 in f(x), x)
-    #  -> foo(let x_new = 2 in f(x_new), x)
-    # i.e. a let which binds a var which is already in scope will
-    # need to rename that var.
-    # Thus there will be a translation table of oldnames to newnames
-    # When entering a let or lambda, if a var is already in the table
-    # it will need further renaming, so make a new entry for the body
-    # Vars that come newly in scope should be translated to themselves
-    if e.isConst:
-        return e
+    def doit(e: Expr, translations) -> Expr:
+        # foo(let x = 2 in f(x), x)
+        #  -> foo(let x_new = 2 in f(x_new), x)
+        # i.e. a let which binds a var which is already in scope will
+        # need to rename that var.
+        # Thus there will be a translation table of oldnames to newnames
+        # When entering a let or lambda, if a var is already in the table
+        # it will need further renaming, so make a new entry for the body
+        # Vars that come newly in scope should be translated to themselves
+        if e.isConst:
+            return e
 
-    if e.isVar:
-        assert e.name in translations
-        return Var(translations[e.name])
+        if e.isVar:
+            assert e.name in translations
+            return Var(translations[e.name])
 
-    if e.isCall:
-        return Call(
-            uniquify_names_aux(e.f, translations),
-            [uniquify_names_aux(arg, translations) for arg in e.args],
-        )
+        if e.isCall:
+            new_f = doit(e.f, translations)
+            new_args = [doit(arg, translations) for arg in e.args]
 
-    if e.isLambda:
-        vars = e.args
+            return Call(new_f, new_args)
 
-        new_translations = {**translations}  # TODO-Q
-        new_vars = []
-        for varname in [var.name for var in vars]:
-            # This var has just come in scope.
-            # If its name is already in translations, it is clashing,
-            # so in the body of this lambda, it will need a new new name
-            if varname in new_translations:
-                newname = "t_" + get_new_name()
-            else:
-                newname = varname
-            new_translations[varname] = newname
-            new_vars.append(Var(newname))
+        if e.isLambda:
+            vars = e.args
 
-        new_body = uniquify_names_aux(e.body, new_translations)
-        return Lambda(new_vars, new_body)
-
-    if e.isLet:
-        new_translations = {**translations}
-        new_eqns = []
-        for eqn in e.eqns:
-            # First recurse into val using new_translations so far
-            newval = uniquify_names_aux(eqn.val, new_translations)
-            # Now add the new vars to the translation table
+            new_translations = {**translations}  # TODO-Q
             new_vars = []
-            for var in eqn.vars:
-                # This var has just come in scope.
-                # If its name is already in translations, it is clashing,
-                # so in the body of this let, it will need a new name
-                if var.name in new_translations:
-                    newname = "t_" + get_new_name()
-                else:
-                    newname = var.name
-                new_translations[var.name] = newname
-                new_vars += [Var(newname)]
-            new_eqns += [Eqn(new_vars, newval)]
+            for varname in [var.name for var in vars]:
+                newname = make_new(varname)
+                new_translations[varname] = newname
+                new_vars.append(Var(newname))
 
-        new_body = uniquify_names_aux(e.body, new_translations)
-        return Let(new_eqns, new_body)
+            new_body = doit(e.body, new_translations)
+            return Lambda(new_vars, new_body)
 
-    assert False  # unreachable
+        if e.isLet:
+            new_translations = {**translations}
+            new_eqns = []
+            for eqn in e.eqns:
+                # First recurse into val using new_translations so far
+                newval = doit(eqn.val, new_translations)
+
+                # Now add the new vars to the translation table
+                new_vars = []
+                for var in eqn.vars:
+                    # This var has just come in scope.
+                    # If its name is already in translations, it is clashing,
+                    # so in the body of this let, it will need a new name
+                    newname = make_new(var.name)
+                    new_translations[var.name] = newname
+                    new_vars += [Var(newname)]
+                new_eqns += [Eqn(new_vars, newval)]
+
+            new_body = doit(e.body, new_translations)
+            return Let(new_eqns, new_body)
+
+        assert False  # unreachable
+
+    return doit(e, translations)
 
 
 def test_uniquify_names():
@@ -967,7 +1124,9 @@ def to_ast(e, name):
 
     assignments = []
     expr = to_ast_aux(e, assignments)
-    assignments += [ast.Assign([ast.Name(name, ast.Store())], expr)]
+    if not (isinstance(expr, ast.Name) and expr.id == name):
+        assignments += [ast.Assign([ast.Name(name, ast.Store())], expr)]
+
     a = ast.Module(body=assignments, type_ignores=[])
     # Do one pass to inline '**dict'
     a = _RewriteDictCallToSplat().visit(a)
@@ -1063,7 +1222,7 @@ def to_ast_aux(e, assignments, binders=None):
 
     if e.isLambda:
         # If I know whom I am bound to, then use that name for the FunctionDef
-        if binders is None:
+        if binders is None or len(binders) != 1:
             v = Var("f" + get_new_name())
         else:
             v = one(binders)
@@ -1104,6 +1263,29 @@ def to_ast_aux(e, assignments, binders=None):
             # Splatting is a keyword with arg=None
             return ast.keyword(value=dictval)
 
+        # Special case: g_tuple
+        if e.f.isVar and e.f.name == "g_tuple":
+            # convert to tuple call
+            elts = [to_ast_aux(a, assignments) for a in e.args]
+            return ast.Tuple(elts=elts, ctx=ast.Load())
+
+        # Special case: g_subscript
+        # g_subscript(x, g_tuple(i, g_slice(None, None, None)))
+        if e.f.isVar and e.f.name == "g_subscript":
+            # convert to subscript call
+            assert len(e.args) == 2
+            value = to_ast_aux(e.args[0], assignments)
+            slices = to_ast_aux(e.args[1], assignments)
+            return ast.Subscript(value=value, slice=slices, ctx=ast.Load())
+
+        # Special case: g_slice
+        if e.f.isVar and e.f.name == "g_slice":
+            # convert to slice call
+            assert len(e.args) == 3
+            args = (None if isNone(a) else to_ast_aux(a, assignments) for a in e.args)
+            lower, upper, step = args
+            return ast.Slice(lower=lower, upper=upper, step=step)
+
         args = [to_ast_aux(arg, assignments) for arg in e.args]
         f = to_ast_aux(e.f, assignments)
 
@@ -1120,7 +1302,9 @@ def to_ast_aux(e, assignments, binders=None):
             if op in _ast_unaryops:
                 return ast.UnaryOp(op=_ast_unaryops[op](), operand=args[0])
 
-            assert False, f"Unknown operator {op}"
+            print(f"to:ast: Unknown operator {op}")
+            return ast.Call(func=f, args=args, keywords=[])
+
         elif isinstance(f, ast.Name) and f.id == "getattr":
             # Special case: getattr
             assert len(args) == 2
@@ -1202,13 +1386,13 @@ def ast_to_expr(a: Optional[ast.AST], path_to_a: List[Optional[ast.AST]]):
 
     # Nodes which encode to (Var or Call)
     if isinstance(a, ast.Attribute):
-        # if isinstance(a.value, ast.Name):
-        #     # just make it a name
-        #     return Var(val.name + '.' + a.attr)
-        # else:
-        #     # make it a getattr call.
         val = recurse(a.value)
-        return Call(Var("getattr"), [val, Const(a.attr)])
+        if val.isVar:
+            # just make it a name
+            return Var(val.name + "." + a.attr)
+        else:
+            # make it a getattr call.
+            return Call(Var("getattr"), [val, Const(a.attr)])
 
     # Nodes which encode to Call
     if isinstance(a, ast.Call):
