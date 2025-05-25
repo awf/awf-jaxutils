@@ -1,25 +1,6 @@
 from more_itertools import one
-from prettyprinter import pretty_call
-from prettyprinter import cpprint
-from prettyprinter import register_pretty, pretty_call
 
-from prettyprinter import register_pretty
-
-# Wadler constructors
-from prettyprinter.doc import (
-    # flat_choice,
-    annotate,  # annotations affect syntax coloring
-    concat,
-    group,  # make what's in here a single line if enough space
-    nest,  # newlines within here are followed by indent + arg
-    align,
-    hang,
-    # NIL,
-    LINE,  # Space or Newline
-    # SOFTLINE,  # nothing or newline
-    HARDLINE,  # newline
-)
-
+import wadler_lindig as wl
 
 from jaxutils.expr import (
     Expr,
@@ -29,58 +10,7 @@ from jaxutils.expr import (
     Const,
     Var,
     Lambda,
-    freevars,
-    preorder_visit,
-    _run_eval,
-    to_ast,
-    ast_to_expr,
-    mkvars,
-    expr_to_python_code,
-    expr_for,
-    eval_expr,
-    transform_postorder,
-    let_to_lambda,
-    is_global_function_name,
 )
-
-
-@register_pretty(Const)
-def _(e, ctx):
-    return repr(e.val)
-
-
-@register_pretty(Var)
-def _(e, ctx):
-    return str(e.name)
-
-
-@register_pretty(Call)
-def _(e, ctx):
-    # args = [pretty_call(ctx, arg) for arg in e.args]
-    if e.f.isVar:
-        return pretty_call(ctx, e.f.name, *e.args)
-    else:
-        return pretty_call(ctx, "call", e.f, *e.args)
-
-
-@register_pretty(Let)
-def _(e, ctx):
-    if any(len(eqn.vars) > 1 for eqn in e.eqns):
-        # If any equation has multiple variables, just pass through
-        return pretty_call(ctx, "let", e.eqns, body=e.body)
-    else:
-        kwargs = {one(eqn.vars).name: eqn.val for eqn in e.eqns}
-        c = pretty_call(ctx, "let", **kwargs, body=e.body)
-        return c
-
-
-@register_pretty(Lambda)
-def _(e, ctx):
-    args = [arg.name for arg in e.args]
-    return pretty_call(ctx, "lambda", args=e.args, body=e.body)
-
-
-import wadler_lindig as wl
 
 
 def wl_pdoc(e):
@@ -130,6 +60,9 @@ def wl_pdoc(e):
         return (let_doc + spc + in_doc).group()
 
     return None
+
+
+from jaxutils.expr import mkvars
 
 
 def _make_e():
