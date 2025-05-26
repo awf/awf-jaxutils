@@ -53,7 +53,7 @@ def _make_e():
                 Eqn([w], Call(v_add, [x, Const(3.3)])),
                 Eqn([z], Call(v_add, [x, w])),
             ],
-            Call(v_mul, [call_lam, y]),
+            Call(v_mul, [call_lam, Let([Eqn([y], v_sin)], y)]),
         ),
     )
     e = Let(
@@ -71,15 +71,16 @@ def test_basic():
 
     e = _make_e()
 
-    pprint(e)
+    print(e)
     assert freevars(e) == {v_sin, v_add, v_mul}
     assert freevars(e.eqns[0].val) == {v_sin, v_add, v_mul}
-    assert freevars(e.eqns[0].val.body) == {x, y, v_sin, v_add, v_mul}
+    assert freevars(e.eqns[0].val.body) == {x, v_sin, v_add, v_mul}
 
 
 def test_visit():
     e = _make_e()
-    preorder_visit(e, lambda x: print(type(x)))
+    l = list(preorder_visit(e, lambda ex, bindings: type(ex).__name__, {}))
+    print(l)
 
 
 def test_eval():
@@ -110,12 +111,12 @@ def test_eval():
 
 def test_let_to_lambda():
     e = _make_e()
-    l = transform_postorder(let_to_lambda, e)
+    l = transform_postorder(let_to_lambda, e, {})
 
     def check(e):
         assert not e.isLet
 
-    preorder_visit(l, check)
+    preorder_visit(l, check, {})
 
 
 def test_ast():

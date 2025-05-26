@@ -142,6 +142,9 @@ class Expr:
     def isLet(self):
         return isinstance(self, Let)
 
+    def __str__(self):
+        return expr_format(self)
+
 
 def exprclass(klass, **kwargs):
     """
@@ -198,29 +201,52 @@ def isNone(x: Optional[Expr]) -> bool:
     return x is None or x.isConst and x.val is None
 
 
-def transform_postorder(transformer: Callable[[Expr], Expr], e: Expr = None):
-    if e is None:
-        # Make transform(transformer)(e) work like transform(transformer, e)
-        return lambda e: transform_postorder(transformer, e)
+def _subscript(e: Expr, i: int) -> Call:
+    return Call(Var("g_subscript"), [e, Const(i)])
 
-    recurse = lambda e: transform_postorder(transformer, e)
+
+def transform_postorder(transformer: Callable[[Expr, Dict], Expr], *args):
+    if len(args) == 0:
+        # Make transform(transformer)(e) work like transform(transformer, e)
+        return lambda *args: transform_postorder(transformer, *args)
+
+    recurse = lambda e, bindings: transform_postorder(transformer, e, bindings)
+
+    e, bindings = args
 
     # Recurse into children
     if e.isLet:
-        new_eqns = [Eqn(eqn.vars, recurse(eqn.val)) for eqn in e.eqns]
-        new_body = recurse(e.body)
+        new_eqns = []
+        new_bindings = bindings.copy()
+        for eqn in e.eqns:
+            # Recurse into the value of the equation
+            new_val = recurse(eqn.val, new_bindings)
+            # And add the equation with the new value
+            new_eqns += [Eqn(eqn.vars, new_val)]
+            # Add the new value to the bindings
+            if len(eqn.vars) == 1:
+                new_bindings[one(eqn.vars).name] = new_val
+            else:
+                for i, var in enumerate(eqn.vars):
+                    new_bindings[var.name] = _subscript(new_val, i)
+
+        new_body = recurse(e.body, new_bindings)
         e = Let(new_eqns, new_body)
 
     if e.isLambda:
-        e = Lambda(e.args, recurse(e.body))
+        new_bindings = bindings.copy()
+        for arg in e.args:
+            new_bindings[arg.name] = None
+        new_body = recurse(e.body, new_bindings)
+        e = Lambda(e.args, new_body)
 
     if e.isCall:
-        new_f = recurse(e.f)
-        new_args = [recurse(arg) for arg in e.args]
+        new_f = recurse(e.f, bindings)
+        new_args = [recurse(arg, bindings) for arg in e.args]
         e = Call(new_f, new_args)
 
     # And pass self to the transformer, with updated children
-    return transformer(e) or e
+    return transformer(e, bindings) or e
 
 
 def freevars(e: Expr) -> Set[Var]:
@@ -261,23 +287,29 @@ def freevars_aux(e: Expr, bound_vars: Set[Var]) -> Set[Var]:
     assert False
 
 
-def preorder_visit(e: Expr, f: Callable[[Expr], Any]):
+def preorder_visit(e: Expr, f: Callable[[Expr, Dict], Any], bindings: Dict[str, Any]):
     # Call f on e
-    yield f(e)
+    yield f(e, bindings)
 
     # And recurse into Expr children
     if e.isLet:
+        inner_bindings = bindings.copy()
         for eqn in e.eqns:
-            yield from preorder_visit(eqn.val, f)
-        yield from preorder_visit(e.body, f)
+            yield from preorder_visit(eqn.val, f, inner_bindings)
+            for var in eqn.vars:
+                inner_bindings[var.name] = eqn.val
+        yield from preorder_visit(e.body, f, inner_bindings)
 
     if e.isLambda:
-        yield from preorder_visit(e.body, f)
+        inner_bindings = bindings.copy()
+        for arg in e.args:
+            inner_bindings[arg.name] = None
+        yield from preorder_visit(e.body, f, inner_bindings)
 
     if e.isCall:
-        yield from preorder_visit(e.f, f)
+        yield from preorder_visit(e.f, f, bindings)
         for arg in e.args:
-            yield from preorder_visit(arg, f)
+            yield from preorder_visit(arg, f, bindings)
 
 
 ### Global functions
@@ -361,7 +393,7 @@ def optimize(e: Expr) -> Expr:
             else:
                 transformation = globals()[transformation_name]
 
-        new_ex = transformation(ex)
+        new_ex = transformation(ex, {})
 
         ex2py(f"{run.count:02d}-{transformation_name}", new_ex)
         run.count += 1
@@ -402,7 +434,7 @@ def optimize(e: Expr) -> Expr:
     return e
 
 
-def inline_call_of_lambda(e: Expr) -> Expr:
+def inline_call_of_lambda(e: Expr, bindings: Dict[str, Any]) -> Expr:
     # call(lambda l_args: body, args)
     #  ->  let l_args = args in body
     # Name clashes will happen unless all bound var names were uniquified
@@ -410,7 +442,7 @@ def inline_call_of_lambda(e: Expr) -> Expr:
         return Let([Eqn(e.f.args, mkTuple(e.args))], e.f.body)
 
 
-def inline_lambda_of_let_of_call(e: Expr) -> Expr:
+def inline_lambda_of_let_of_call(e: Expr, bindings: Dict[str, Any]) -> Expr:
     # lambda args: let eqns in call(f, args)
     #  ->  let eqns in f
     # Name clashes will happen unless all bound var names were uniquified
@@ -419,7 +451,7 @@ def inline_lambda_of_let_of_call(e: Expr) -> Expr:
             return Let(e.body.eqns, e.body.body.f)
 
 
-def inline_trivial_letbody(e: Expr) -> Expr:
+def inline_trivial_letbody(e: Expr, bindings: Dict[str, Any]) -> Expr:
     # let var = val in var -> val
     if e.isLet and len(e.eqns) == 1 and len(e.eqns[0].vars) == 1:
         if e.eqns[0].vars == [e.body]:
@@ -428,7 +460,7 @@ def inline_trivial_letbody(e: Expr) -> Expr:
         return e.body
 
 
-def inline_lambda_of_call(e: Expr) -> Expr:
+def inline_lambda_of_call(e: Expr, bindings: Dict[str, Any]) -> Expr:
     # Lambda(args, Call(f, args)) -> f
     if e.isLambda:
         if e.body.isCall:
@@ -474,7 +506,7 @@ def compute_variable_use_counts(e: Expr) -> Expr:
     return var_to_count
 
 
-def inline_trivial_rhs(e: Expr) -> Expr:
+def inline_single_usages(e: Expr) -> Expr:
     # let
     #   v1 = e1
     #   v2 = e2
@@ -521,39 +553,62 @@ def inline_trivial_rhs(e: Expr) -> Expr:
 
 
 def dce(e: Expr) -> Expr:
-    e = uniquify_names(e)
-    var_to_count = compute_variable_use_counts(e)
+    """
+    Dead Code Elimination
+    Remove bindings to unused variables.
+    """
 
-    def recurse(e):
+    def recurse(e, var_to_count):
         if e.isConst:
             return e
 
         if e.isVar:
+            var_to_count[e.name] += 1
             return e
 
         if e.isLet:
-            eqns = []
+            local_var_to_count = var_to_count.copy()
+            new_vals = []
             for eqn in e.eqns:
-                val = recurse(eqn.val)
-                var = one(eqn.vars)
-                if var_to_count[var.name] > 0:
-                    eqns += [Eqn(eqn.vars, val)]
+                val = recurse(eqn.val, local_var_to_count)
+                for var in eqn.vars:
+                    local_var_to_count[var.name] = 0
+                new_vals += [val]
+            body = recurse(e.body, local_var_to_count)
 
-            body = recurse(e.body)
-            return Let(eqns, body)
+            new_eqns = []
+            for eqn, val in zip(e.eqns, new_vals):
+                any_used = any(local_var_to_count[var.name] > 0 for var in eqn.vars)
+                if any_used:
+                    # Replace any unused with "_"
+                    new_vars = [
+                        var if local_var_to_count[var.name] > 0 else Var("_")
+                        for var in eqn.vars
+                    ]
+                    new_eqns += [Eqn(new_vars, val)]
+
+            if not new_eqns:
+                # If no equations left, just return the body
+                return body
+            else:
+                return Let(new_eqns, body)
 
         if e.isCall:
-            f = recurse(e.f)
-            args = [recurse(a) for a in e.args]
+            f = recurse(e.f, var_to_count)
+            args = [recurse(a, var_to_count) for a in e.args]
             return Call(f, args)
 
         if e.isLambda:
-            body = recurse(e.body)
+            local_var_to_count = var_to_count.copy()
+            for arg in e.args:
+                local_var_to_count[arg.name] = 0
+            body = recurse(e.body, local_var_to_count)
             return Lambda(e.args, body)
 
         assert False
 
-    return recurse(e)
+    var_to_count = defaultdict(lambda: 0)
+    return recurse(e, var_to_count)
 
 
 def detuple_lets(e: Expr) -> Expr:
@@ -565,7 +620,7 @@ def detuple_lets(e: Expr) -> Expr:
     #       Eqn(c, t[2])],
     #           body)))
 
-    def doit(e):
+    def doit(e, bindings):
         if not e.isLet:
             return e
 
@@ -587,10 +642,10 @@ def detuple_lets(e: Expr) -> Expr:
         new_eqns = list(chain(*map(detuple_eqn, e.eqns)))
         return Let(new_eqns, e.body)
 
-    return transform_postorder(doit, e)
+    return transform_postorder(doit, e, {})
 
 
-def detuple_tuple_assignments(e: Expr) -> Expr:
+def detuple_tuple_assignments(e: Expr, bindings: Dict[str, Any]) -> Expr:
     # Let([Eqn([a, b, c], Call(tuple, [aprime, bprime, cprime]))],
     #       body) ->
     #  Let([Eqn(a, aprime),
@@ -648,37 +703,37 @@ def detuple_tuple_assignments(e: Expr) -> Expr:
 #     cse(e)
 
 
-def to_anf(e):
+def to_anf(e, bindings):
     e = uniquify_names(e)
     assignments = []
-    expr = to_anf_aux(e, assignments)
+    expr = to_anf_aux(e, assignments, bindings)
     return Let(assignments, expr)
 
 
-def to_anf_aux(e, assignments):
+def to_anf_aux(e, assignments, bindings):
     if e.isConst or e.isVar:
         return e
 
     if e.isLet:
         for eqn in e.eqns:
-            new_val = to_anf_aux(eqn.val, assignments)
+            new_val = to_anf_aux(eqn.val, assignments, bindings)
             assignments += [Eqn(eqn.vars, new_val)]
-        abody = to_anf_aux(e.body, assignments)
+        abody = to_anf_aux(e.body, assignments, bindings)
         return abody
 
     if e.isLambda:
-        return Lambda(e.args, to_anf(e.body))
+        return Lambda(e.args, to_anf(e.body, bindings))
 
     if e.isCall:
-        new_f = to_anf_aux(e.f, assignments)
-        new_args = [to_anf_aux(arg, assignments) for arg in e.args]
+        new_f = to_anf_aux(e.f, assignments, bindings)
+        new_args = [to_anf_aux(arg, assignments, bindings) for arg in e.args]
         return Call(new_f, new_args)
 
     assert False
 
 
-def inline_trivial_assignments(e):
-    return inline_trivial_assignments_aux(e, {})
+def inline_trivial_assignments(e, bindings):
+    return inline_trivial_assignments_aux(e, bindings)
 
 
 @beartype
@@ -764,13 +819,13 @@ def test_inline_trivial_assignments():
             ],
         ),
     )
-    out = inline_trivial_assignments(e)
+    out = inline_trivial_assignments(e, {})
     pprint(out)
     expect = Call(b, [Call(c, [c, b, c])])
     assert out == expect
 
 
-def let_to_lambda(e: Expr) -> Expr:
+def let_to_lambda(e: Expr, bindings: Dict[str, Any]) -> Expr:
     """
     let x1 = val1, x2 = val2 in body
     ->
@@ -782,29 +837,20 @@ def let_to_lambda(e: Expr) -> Expr:
         for eqn in e.eqns:
             assert len(eqn.vars) == 1, "Use detuple_lets before let_to_lambda"
             args += eqn.vars
+            vals += [eqn.val]
 
-            val = transform_postorder(let_to_lambda, eqn.val)
-            vals += [val]
-
-        body = transform_postorder(let_to_lambda, e.body)
-        return Call(Lambda(args, body), vals)
+        return Call(Lambda(args, e.body), vals)
 
 
-def elide_empty_lhs(e: Expr) -> Expr:
+def elide_empty_lhs(e: Expr, bindings: Dict[str, Any]) -> Expr:
     """
     let [] = val1, x2 = val2 in body
     ->
     let x2 = val2 in body
     """
     if e.isLet:
-        return Let(
-            [
-                Eqn(eqn.vars, transform_postorder(elide_empty_lhs, eqn.val))
-                for eqn in e.eqns
-                if len(eqn.vars) > 0
-            ],
-            transform_postorder(elide_empty_lhs, e.body),
-        )
+        eqns = [Eqn(eqn.vars, eqn.val) for eqn in e.eqns if len(eqn.vars) > 0]
+        return Let(eqns, e.body)
 
 
 def ex2py(name, ex):
@@ -821,7 +867,7 @@ def ex2py(name, ex):
         print(astunparse.unparse(to_ast(ex, "ret")), file=f)
 
 
-def identify_identities(e: Expr) -> Expr:
+def identify_identities(e: Expr, bindings: Dict[str, Any]) -> Expr:
     """
     lambda x: x -> g_identity
     """
@@ -829,7 +875,7 @@ def identify_identities(e: Expr) -> Expr:
         return Var("g_identity")
 
 
-def eliminate_identities(e: Expr) -> Expr:
+def eliminate_identities(e: Expr, bindings: Dict[str, Any]) -> Expr:
     """
     g_identity(args) -> args
     """
@@ -1114,22 +1160,17 @@ def _ast_op_to_Var(op):
         raise ValueError(f"Unknown operator {op}")
 
 
-lambda_to_name = {}
-
-
 def to_ast(e, name):
-    e = uniquify_names(e)
-    global lambda_to_name
-    lambda_to_name = {}
-
+    var = Var(name)
     assignments = []
-    expr = to_ast_aux(e, assignments)
-    if not (isinstance(expr, ast.Name) and expr.id == name):
+    if expr := to_ast_aux(e, assignments, [var]):
         assignments += [ast.Assign([ast.Name(name, ast.Store())], expr)]
 
     a = ast.Module(body=assignments, type_ignores=[])
+
     # Do one pass to inline '**dict'
     a = _RewriteDictCallToSplat().visit(a)
+
     ast.fix_missing_locations(a)
     return a
 
@@ -1215,14 +1256,12 @@ def to_ast_aux(e, assignments, binders=None):
             if aval := to_ast_aux(eqn.val, assignments, binders=eqn.vars):
                 assignments += [ast.Assign(targets=avars, value=aval)]
 
-        inner_assignments = []
-        abody = to_ast_aux(e.body, inner_assignments)
-        assignments += inner_assignments
+        abody = to_ast_aux(e.body, assignments)
         return abody
 
     if e.isLambda:
         # If I know whom I am bound to, then use that name for the FunctionDef
-        if binders is None or len(binders) != 1:
+        if binders is None:
             v = Var("f" + get_new_name())
         else:
             v = one(binders)
@@ -1387,12 +1426,7 @@ def ast_to_expr(a: Optional[ast.AST], path_to_a: List[Optional[ast.AST]]):
     # Nodes which encode to (Var or Call)
     if isinstance(a, ast.Attribute):
         val = recurse(a.value)
-        if val.isVar:
-            # just make it a name
-            return Var(val.name + "." + a.attr)
-        else:
-            # make it a getattr call.
-            return Call(Var("getattr"), [val, Const(a.attr)])
+        return Call(Var("getattr"), [val, Const(a.attr)])
 
     # Nodes which encode to Call
     if isinstance(a, ast.Call):
@@ -1507,7 +1541,242 @@ def _ast_to_eqn(stmt, path_to_a):
     assert False, f"Unknown statement {stmt}"
 
 
-#### Misc
+########################################################################################
+#
+#
+#   888888888888            ad88888ba   ad88888ba        db
+#        88                d8"     "8b d8"     "8b      d88b
+#        88                Y8,         Y8,             d8'`8b
+#        88  ,adPPYba,     `Y8aaaaa,   `Y8aaaaa,      d8'  `8b
+#        88 a8"     "8a      `"""""8b,   `"""""8b,   d8YaaaaY8b
+#        88 8b       d8            `8b         `8b  d8""""""""8b
+#        88 "8a,   ,a8"    Y8a     a8P Y8a     a8P d8'        `8b
+#        88  `"YbbdP"'      "Y88888P"   "Y88888P" d8'          `8b
+#
+#
+########################################################################################
+
+
+def to_ssa(e: Expr) -> Let | Var | Const | Lambda:
+    """
+    Convert an expression to SSA form.
+    """
+    if e.isVar or e.isConst:
+        return e
+
+    if e.isLambda:
+        return Lambda(e.args, to_ssa(e.body))
+
+    if e.isLet:
+        # let
+        #   vs1 = e1
+        #   vs2 = e2
+        #   vs3 = var3
+        # in
+        #   e4
+        # becomes
+        # let
+        #   vs1 = let eqns1 in var1
+        #   vs2 = let eqns2 in var2
+        #   vs3 = var3
+        # in
+        #   let eqns4 in var4
+        # becomes
+        # let
+        #   eqns1
+        #   vs1 = var1
+        #   eqns2
+        #   vs2 = var2
+        #   vs3 = var3
+        #   eqns4
+        # in var4
+
+        eqns = []
+        for eqn in e.eqns:
+            val = to_ssa(eqn.val)
+            if val.isLet:
+                eqns += val.eqns
+                val = val.body
+            eqns += [Eqn(eqn.vars, val)]
+
+        body = to_ssa(e.body)
+        if body.isLet:
+            eqns += body.eqns
+            body = body.body
+
+        return Let(eqns, body)
+
+    if e.isCall:
+        #   Call(f, e1, e2, ...)
+        # becomes
+        #   Call(let eqns0 in var0, let eqns1 in var1, let eqns2 in var2, ...)
+        # becomes
+        #   let
+        #     eqns0
+        #     eqns1
+        #     eqns2
+        #     out = Call(vs0, vs1, vs2)
+        #   in
+        #     out
+
+        eqns = []
+        f = to_ssa(e.f)
+        if f.isLet:
+            eqns += f.eqns
+            f = f.body
+
+        args = []
+        for v in e.args:
+            v = to_ssa(v)
+            if v.isLet:
+                eqns += v.eqns
+                args += [v.body]
+            else:
+                args += [v]
+
+        if f.isVar and f.name.startswith("operator."):
+            f = Var(f"ssa_{f.name}")
+
+        call_val = Call(f, args)
+        call_var = Var("out" + get_new_name())
+        return Let(eqns + [Eqn([call_var], call_val)], call_var)
+
+    assert False
+
+
+def assert_is_ssa(e: Expr) -> bool:
+    """
+    Check if an expression is in SSA form.
+    """
+
+    def is_val(e):
+        return e.isVar or e.isConst
+
+    if e.isLet:
+        # let
+        #   vs1 = rhs1
+        #   vs2 = rhs2
+        #   vs3 = rhs3
+        # in
+        #   body
+        # is SSA if all rhss are vals and body is val
+        # and also recurse into lambdas
+        for eqn in e.eqns:
+            if eqn.val.isLambda or eqn.val.isCall:
+                assert_is_ssa(eqn.val)
+            else:
+                assert is_val(eqn.val)
+
+    elif e.isLambda:
+        assert_is_ssa(e.body)
+
+    elif e.isCall:
+        assert is_val(e.f) or e.f.isLambda
+        assert all(map(is_val, e.args))
+    else:
+        assert is_val(e)
+
+
+def to_ssa_tidy(e):
+    """
+    Convert an expression to SSA form and tidy it up.
+    """
+    e = to_ssa(e)
+    e = detuple_lets(e)
+    e = inline_single_usages(e)
+    e = dce(e)
+    e = to_ssa(e)
+    return e
+
+
+########################################################################################
+#
+#
+#   88888888ba
+#   88      "8b                         ,d      ,d
+#   88      ,8P                         88      88
+#   88aaaaaa8P' 8b,dPPYba,  ,adPPYba, MM88MMM MM88MMM 8b       d8
+#   88""""""'   88P'   "Y8 a8P_____88   88      88    `8b     d8'
+#   88          88         8PP"""""""   88      88     `8b   d8'
+#   88          88         "8b,   ,aa   88,     88,     `8b,d8'
+#   88          88          `"Ybbd8"'   "Y888   "Y888     Y88'
+#                                                         d8'
+#                                                        d8'
+########################################################################################
+
+import wadler_lindig as wl
+
+
+def wl_pdoc(e):
+    if not isinstance(e, Expr):
+        return None
+
+    recurse = lambda x: wl.pdoc(x, custom=wl_pdoc)
+    spc = wl.BreakDoc(" ")
+    semi = wl.BreakDoc("; ")
+
+    if e.isVar:
+        return wl.TextDoc(e.name)
+
+    if e.isConst:
+        return wl.TextDoc(repr(e.val))
+
+    if e.isCall:
+        fn = recurse(e.f)
+        brk = wl.BreakDoc("")
+        if len(e.args) > 0:
+            args = [recurse(arg) for arg in e.args]
+            args = wl.join(wl.comma, args)
+            args = (brk + args.group()).nest(2)
+            return (fn + wl.TextDoc("(")).group() + args + brk + wl.TextDoc(")")
+        else:
+            return (fn + wl.TextDoc("()")).group()
+
+    if e.isLambda:
+        args = [wl.TextDoc(arg.name) for arg in e.args]
+        args = wl.join(wl.comma, args)
+        head = (wl.TextDoc("lambda") + wl.TextDoc(" ") + args + wl.TextDoc(":")).group()
+        body = recurse(e.body)
+        return (wl.TextDoc("{") + head + spc + body + wl.TextDoc("}")).group().nest(2)
+
+    if e.isLet:
+
+        def doeqn(vars, val):
+            vars = wl.join(wl.comma, list(map(recurse, vars)))
+            return (
+                ((vars + spc + wl.TextDoc("=")).group() + spc + recurse(val))
+                .group()
+                .nest(2)
+            )
+
+        eqns = [doeqn(eqn.vars, eqn.val) for eqn in e.eqns]
+        eqns = wl.join(semi, eqns)
+        body = recurse(e.body)
+        let_doc = (wl.TextDoc("let") + spc + eqns).group().nest(2)
+        in_doc = (wl.TextDoc("in") + spc + body).group().nest(2)
+        return (let_doc + spc + in_doc).group()
+
+    return None
+
+
+def expr_format(e, **kwargs):
+    return wl.pformat(e, custom=wl_pdoc, **kwargs)
+
+
+########################################################################################
+#
+#
+#   88b           d88 88
+#   888b         d888 ""
+#   88`8b       d8'88
+#   88 `8b     d8' 88 88 ,adPPYba,  ,adPPYba,
+#   88  `8b   d8'  88 88 I8[    "" a8"     ""
+#   88   `8b d8'   88 88  `"Y8ba,  8b
+#   88    `888'    88 88 aa    ]8I "8a,   ,aa
+#   88     `8'     88 88 `"YbbdP"'  `"Ybbd8"'
+#
+#
+########################################################################################
 
 
 def expr_for(f: Callable) -> Expr:
@@ -1516,6 +1785,26 @@ def expr_for(f: Callable) -> Expr:
 
     a = ast.parse(textwrap.dedent(inspect.getsource(f)))
     return ast_to_expr(a, [])
+
+
+def rename_let_v_in_v(e, name):
+    # Force name of first bound item to be 'name'
+    if e.isLet:
+        if len(e.eqns) > 0 and len(e.eqns[0].vars) == 1:
+            ename = e.eqns[0].vars[0].name
+            if e.body.isVar and ename == e.body.name:
+                # If the first bound item is the same as the body, then
+                # we can just use the name of the first bound item
+                return Let(
+                    [Eqn([Var(name)], e.eqns[0].val)] + e.eqns[1:],
+                    Var(name),
+                )
+        # It's a let, but the first bound item is not a single var
+        print(f"rename_let_v_in_v: {e}\nrename_let_v_in_v: cannot rename to {name}")
+        return e
+    else:
+        # Wrap it in a Let
+        return Let([Eqn([Var(name)], e)], Var(name))
 
 
 def expr_to_python_code(e: Expr, name: str) -> str:

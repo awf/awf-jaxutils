@@ -293,7 +293,7 @@ def softmax(x):
 def softmax_vjp(x, dret):
     assert x.shape == dret.shape
     ret = jnn.softmax(x, axis=0)
-    return ret * dret - ret * jnp.sum(ret * dret, axis=0)[jnp.newaxis, :]
+    return ret * dret - ret * jnp.sum(ret * dret, axis=0)
 
 
 def test_softmax():

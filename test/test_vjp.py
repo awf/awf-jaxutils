@@ -11,13 +11,14 @@ def ffn(W, x):
     return jax.nn.softmax(y2)
 
 
-rand = np.random.rand
-W = (rand(11, 7), rand(11), rand(10, 11), rand(10))
-x = rand(7)
+B = 1
+rand = lambda *args: jnp.array(np.random.rand(*args))
+W = (rand(11, 7), rand(11, B), rand(10, 11), rand(10, B))
+x = rand(7, B)
 
 
 def loss(W, x):
-    return -jnp.log(ffn(W, x)[5])
+    return -jnp.log(ffn(W, x)[5, 0])
 
 
 import jaxutils.expr as jex
@@ -32,10 +33,47 @@ from jaxutils.expr import (
     Var,
     Const,
     Lambda,
+    to_ssa,
+    to_ssa_tidy,
+    assert_is_ssa,
+    transform_postorder,
+    rename_let_v_in_v,
 )
+from more_itertools import one
 
 
-def make_vjp(e: Expr, d_outs: list[Var] = None) -> Expr:
+def test_to_ssa():
+    def foo(x):
+        y = x + (1 + foo(foo(x)))
+        z = (lambda q: q * (q + foo(q)))(y + 2 + 4)
+        return z
+
+    e = expr_for(foo)
+    print(expr_to_python_code(e, "foo"))
+    e = to_ssa(e)
+    print(expr_to_python_code(e, "foo"))
+    assert_is_ssa(e)
+
+    e = expr_for(ffn)
+    print(expr_to_python_code(e, "foo"))
+    e = to_ssa(e)
+    print(expr_to_python_code(e, "foo"))
+    assert_is_ssa(e)
+
+    e = jex.detuple_lets(e)
+
+    e = jex.uniquify_names(e)
+    ucs = jex.compute_variable_use_counts(e)
+    for k, v in ucs.items():
+        print(k, v)
+
+    e = jex.inline_single_usages(e)
+    e = jex.dce(e)
+    e = to_ssa(e)
+    print(expr_to_python_code(e, "ssa"))
+
+
+def make_vjp(e: Expr, d_ins: list[Var] = None) -> Expr:
     """
     # The python transform:
     def foo(ins1, ins2):
@@ -68,11 +106,15 @@ def make_vjp(e: Expr, d_outs: list[Var] = None) -> Expr:
         d_ins1, d_ins2
 
     """
+
+    def d(v):
+        return Var("d_" + v.name)
+
     if e.isVar:
-        return Var("d_" + e.name)
+        return d(e)
 
     if e.isConst:
-        return Var("drop")
+        return Var("_")
 
     if e.isLet:
 
@@ -86,35 +128,54 @@ def make_vjp(e: Expr, d_outs: list[Var] = None) -> Expr:
             outs = eqn.vars
             d_outs = [make_vjp(v) for v in outs]
 
-            f_vjp = Var(eqn.val.f.name + "_vjp")
+            f_vjp = Var(f"vjp[{eqn.val.f.name}]")
             val = Call(f_vjp, ins + d_outs)
             return Eqn(d_ins, val)
 
         def make_for_lambda(eqn):
+            """
+            lambda ins: let eqns in outs
+            ->
+            lambda ins, d_outs: let D[eqns] in d_ins
+            """
+
             lam = eqn.val
             assert lam.isLambda
             assert lam.body.isLet
-            assert lam.body.body.isVar
+
             out = lam.body.body
+            assert out.isVar
             d_out = make_vjp(out)
 
-            body_vjp = make_vjp(lam.body)
-            # d_ins = [make_vjp(v) for v in lam.args]
-            args = lam.args + [d_out]
-            return Eqn(args, Lambda(args, body_vjp))
+            d_ins = [make_vjp(v) for v in lam.args]
+            body_vjp = make_vjp(lam.body, d_ins)
+            new_args = lam.args + [d_out]
+            new_lam = Lambda(new_args, body_vjp)
+
+            var = one(eqn.vars)
+            return Eqn([d(var)], new_lam)
 
         def make_for_eqn(eqn):
             if eqn.val.isCall:
                 return make_for_call(eqn)
             if eqn.val.isLambda:
                 return make_for_lambda(eqn)
+            if eqn.val.isVar:
+                # out = in
+                # ->
+                # d_in = d_out
+                vin = eqn.val
+                vout = one(eqn.vars)
+                d_in = d(vin)
+                d_out = d(vout)
+                return Eqn([d_in], d_out)
             assert False, f"Unknown eqn type {eqn.val}"
 
         eqn_vjps = [make_for_eqn(eqn) for eqn in reversed(e.eqns)]
         eqns = e.eqns + eqn_vjps
         assert e.body.isVar
         body = make_vjp(e.body)
-        return Let(eqns, body)
+        return Let(eqns, jex.mkTuple(d_ins))
 
     # if e.isLambda:
     #     assert e.body.isLet
@@ -132,204 +193,87 @@ def make_vjp(e: Expr, d_outs: list[Var] = None) -> Expr:
     assert False
 
 
-from itertools import chain
+def inline_var_eq_var(e):
+    def transform(e, bindings):
+        if e.isLet:
+            new_eqns = []
+            for eqn in e.eqns:
+                new_val = eqn.val
+                if eqn.val.isVar and eqn.val.name in bindings:
+                    # Inline the variable
+                    new_val = bindings[eqn.val.name]
+
+                new_eqns += [Eqn(eqn.vars, new_val)]
+            return Let(new_eqns, e.body)
+
+    return transform_postorder(transform, e, {})
 
 
-def to_ssa(e: Expr) -> Let | Var | Const:
-    """
-    Convert an expression to SSA form.
-    """
-    if e.isVar or e.isConst:
-        return e
+def global_getattrs_to_names(e):
+    def transform(e, bindings):
+        if e.isCall and e.f.isVar and e.f.name == "getattr":
+            obj = e.args[0]
+            attr = e.args[1]
+            if obj.isVar and obj.name not in bindings:
+                # It's a reference to a global variable, assume it's a module
+                return Var(f"{obj.name}.{attr.val}")
 
-    if e.isLet:
-        # let
-        #   vs1 = e1
-        #   vs2 = e2
-        #   vs3 = var3
-        # in
-        #   e4
-        # becomes
-        # let
-        #   vs1 = let eqns1 in var1
-        #   vs2 = let eqns2 in var2
-        #   vs3 = var3
-        # in
-        #   let eqns4 in var4
-        # becomes
-        # let
-        #   eqns1
-        #   vs1 = var1
-        #   eqns2
-        #   vs2 = var2
-        #   vs3 = var3
-        #   eqns4
-        # in var4
-
-        eqns = []
-        for eqn in e.eqns:
-            val = to_ssa(eqn.val)
-            if val.isLet:
-                eqns += val.eqns
-                val = val.body
-            eqns += [Eqn(eqn.vars, val)]
-
-        body = to_ssa(e.body)
-        if body.isLet:
-            eqns += body.eqns
-            body = body.body
-
-        return Let(eqns, body)
-
-    if e.isLambda:
-        # lambda args: body
-        # becomes
-        # let f = lambda args: let eqns in body
-        # in f
-        body = to_ssa(e.body)
-        lam = Lambda(e.args, body)
-        var = Var("f" + jex.get_new_name())
-        return Let([Eqn([var], lam)], var)
-
-    if e.isCall:
-        #   Call(f, e1, e2, ...)
-        # becomes
-        #   Call(let eqns0 in var0, let eqns1 in var1, let eqns2 in var2, ...)
-        # becomes
-        #   let
-        #     eqns0
-        #     eqns1
-        #     eqns2
-        #     out = Call(vs0, vs1, vs2)
-        #   in
-        #     out
-
-        eqns = []
-        f = to_ssa(e.f)
-        if f.isLet:
-            eqns += f.eqns
-            f = f.body
-
-        args = []
-        for v in e.args:
-            v = to_ssa(v)
-            if v.isLet:
-                eqns += v.eqns
-                args += [v.body]
-            else:
-                args += [v]
-
-        call_val = Call(f, args)
-        call_var = Var("out" + jex.get_new_name())
-        return Let(eqns + [Eqn([call_var], call_val)], call_var)
-
-    assert False
+    return transform_postorder(transform, e, {})
 
 
-def assert_is_ssa(e: Expr) -> bool:
-    """
-    Check if an expression is in SSA form.
-    """
-
-    def is_val(e):
-        return e.isVar or e.isConst
-
-    if e.isLet:
-        # let
-        #   vs1 = rhs1
-        #   vs2 = rhs2
-        #   vs3 = rhs3
-        # in
-        #   body
-        # is SSA if all rhss are vals and body is val
-        # and also recurse into lambdas
-        for eqn in e.eqns:
-            if eqn.val.isLambda or eqn.val.isCall:
-                assert_is_ssa(eqn.val)
-            else:
-                assert is_val(eqn.val)
-
-    elif e.isLambda:
-        assert_is_ssa(e.body)
-
-    elif e.isCall:
-        assert is_val(e.f)
-        assert all(map(is_val, e.args))
-    else:
-        assert is_val(e)
+from jaxutils.vjp import softmax, relu
 
 
-def to_ssa_tidy(e):
-    """
-    Convert an expression to SSA form and tidy it up.
-    """
-    e = to_ssa(e)
-    e = jex.detuple_lets(e)
-    e = jex.inline_trivial_rhs(e)
-    e = jex.dce(e)
-    e = to_ssa(e)
-    return e
+def ffn_flat(W1, b1, W2, b2, x):
+    t1 = W1 @ x + b1
+    y1 = relu(t1)
+    y2 = W2 @ y1 + b2
+    return softmax(y2)
 
 
-def test_to_ssa():
-    def foo(x):
-        y = x + (1 + foo(foo(x)))
-        z = (lambda q: q * (q + foo(q)))(y + 2 + 4)
-        return z
-
-    e = expr_for(foo)
-    print(expr_to_python_code(e, "foo"))
-    e = to_ssa(e)
-    print(expr_to_python_code(e, "foo"))
-    assert_is_ssa(e)
-
-    e = expr_for(ffn)
-    print(expr_to_python_code(e, "foo"))
-    e = to_ssa(e)
-    print(expr_to_python_code(e, "foo"))
-    assert_is_ssa(e)
-
-    e = jex.detuple_lets(e)
-
-    # ucs = jex.compute_variable_use_counts(e)
-    # for k, v in ucs.items():
-    #     print(k, v)
-
-    e = jex.inline_trivial_rhs(e)
-    e = jex.dce(e)
-    e = to_ssa(e)
-    print(expr_to_python_code(e, "ssa"))
+from awfutils import import_from_file
 
 
 def test_vjp():
-    e = expr_for(ffn)
-    print(expr_to_python_code(e, "ffn"))
+    e = expr_for(ffn_flat)
+    print(expr_to_python_code(e, "ffn_flat"))
+
+    e = global_getattrs_to_names(e)
+    e = inline_var_eq_var(e)
 
     e = to_ssa_tidy(e)
-    print(expr_to_python_code(e, "ffn"))
+    e = rename_let_v_in_v(e, "ffn_flat_ssa")
+    print(expr_to_python_code(e, "ffn_flat_ssa"))
 
-    vjp = make_vjp(e)
-    print(expr_to_python_code(vjp, "ffn_vjp"))
+    vjp = make_vjp(e, [Var("d_ffn_flat_ssa")])
+    print("\n\n*** VJP ***")
+    code = expr_to_python_code(vjp, "d_ffn_flat_ssa")
+    print(code)
 
-    def ffn_vjp(W_1_0, x_1_0, d_out11):
-        out08_0 = W_1_0[2]
-        out09_0 = W_1_0[0]
-        out0a_0 = out09_0 @ x_1_0
-        out0b_0 = W_1_0[1]
-        out0c_0 = out0a_0 + out0b_0
-        out0d_0 = jax.nn.relu(out0c_0)
-        out0e_0 = out08_0 @ out0d_0
-        out0f_0 = W_1_0[3]
-        out10_0 = out0e_0 + out0f_0
-        out11_0 = jax.nn.softmax(out10_0)
-        d_out10 = jax.nn.softmax_vjp(out10_0, d_out11)
-        d_out0e, d_out0f = operator.__add___vjp(out0e_0, out0f_0, d_out10)
-        d_W_1, drop = g_subscript_vjp(W_1_0, 3, d_out0f)
-        d_out08, d_out0d = operator.__matmul___vjp(out08_0, out0d_0, d_out0e)
-        d_out0c = jax.nn.relu_vjp(out0c_0, d_out0d)
-        d_out0a, d_out0b = operator.__add___vjp(out0a_0, out0b_0, d_out0c)
-        d_W_1_0, drop_0 = g_subscript_vjp(W_1_0, 1, d_out0b)
-        d_out09, d_x_1 = operator.__matmul___vjp(out09_0, x_1_0, d_out0a)
-        d_W_1_1, drop_1 = g_subscript_vjp(W_1_0, 0, d_out09)
-        d_W_1_2, drop_2 = g_subscript_vjp(W_1_0, 2, d_out08)
-        return d_out11
+    with open("tmp/ffn_flat_vjp.py", "w") as f:
+        print(
+            """
+import operator as ssa_operator
+from jaxutils.vjp import softmax, relu, add_vjp, mm_vjp, softmax_vjp, relu_vjp
+
+vjp = {
+    ssa_operator.__add__: add_vjp,
+    ssa_operator.__matmul__: mm_vjp,
+    softmax: softmax_vjp,
+    relu: relu_vjp,
+}
+""",
+            file=f,
+        )
+        print(code, file=f)
+
+    mod = import_from_file("tmp/ffn_flat_vjp.py", "ffn_flat_vjp")
+
+    W1, b1, W2, b2 = W
+    d_out10 = rand(10, B)
+    g0 = jax.vjp(ffn_flat, W1, b1, W2, b2, x)[1](d_out10)
+
+    g = mod.d_ffn_flat_ssa(W1, b1, W2, b2, x, d_out10)
+
+    for g, g0 in zip(g, g0):
+        np.testing.assert_allclose(g, g0, atol=1e-5)
