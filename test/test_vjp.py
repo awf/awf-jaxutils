@@ -11,8 +11,10 @@ def ffn(W, x):
     return jax.nn.softmax(y2)
 
 
-B = 1
+np.random.seed(1)
 rand = lambda *args: jnp.array(np.random.rand(*args))
+
+B = 1
 W = (rand(11, 7), rand(11, B), rand(10, 11), rand(10, B))
 x = rand(7, B)
 
@@ -234,8 +236,12 @@ def ffn_flat(W1, b1, W2, b2, x):
 
 from awfutils import import_from_file
 
+import pytest
 
-def test_vjp():
+
+@pytest.mark.parametrize("opt", ["opt", "raw"])
+@pytest.mark.parametrize("ssa", ["ssa", "orig"])
+def test_vjp(opt, ssa):
     W1, b1, W2, b2 = W
     print(ffn_flat(W1, b1, W2, b2, x))
 
@@ -245,14 +251,31 @@ def test_vjp():
     e = global_getattrs_to_names(e)
     e = inline_var_eq_var(e)
 
-    e = to_ssa_tidy(e)
-    e = rename_let_v_in_v(e, "ffn_flat_ssa")
-    print(expr_to_python_code(e, "ffn_flat_ssa"))
+    if ssa == "ssa":
+        e_ssa = to_ssa_tidy(e)
+        e_ssa = rename_let_v_in_v(e_ssa, "ffn_flat")
+        e = e_ssa
 
-    # vjp = jex.make_vjp(e.eqns[0].val, [])
-    vjp = jex.make_vjp(e.eqns[0].val, [])
+    print(expr_to_python_code(e, "ffn_flat"))
+
+    # fvs, vjp_raw = jex.make_vjp(e_ssa, [Var("dffn_flat_ssa")])
+    fvs, vjp_raw = jex.make_vjp(e, [Var("dffn_flat")])
+    # assert not fvs, f"Free vars in VJP: {fvs}"
+
+    print("\n\n*** VJP (RAW) ***")
+    code = expr_to_python_code(vjp_raw, "d_ffn_flat")
+    print(code)
+
+    if opt == "raw":
+        vjp = vjp_raw
+    elif opt == "opt":
+        vjp = jex.optimize(vjp_raw)
+        vjp = jex.dce(vjp)
+    else:
+        raise ValueError(f"Unknown optimization option: {opt}")
+
     print("\n\n*** VJP ***")
-    code = expr_to_python_code(vjp, "d_ffn_flat_ssa")
+    code = expr_to_python_code(vjp, "d_ffn_flat")
     print(code)
 
     with open("tmp/ffn_flat_vjp.py", "w") as f:
@@ -260,17 +283,21 @@ def test_vjp():
             """
 from jaxutils.expr_lib import g_zeros_like
 import operator as ssa_operator
+import operator
 from jaxutils.vjp import (
-    softmax, softmax_vjp, 
-    relu, relu_vjp, 
+    softmax, softmax_vjp,
+    relu, relu_vjp,
     transpose, transpose_vjp,
     add_vjp, mm_vjp, mul_vjp,
 )
- 
+
 vjp = {
     ssa_operator.__add__: add_vjp,
     ssa_operator.__matmul__: mm_vjp,
     ssa_operator.__mul__: mul_vjp,
+    operator.__add__: add_vjp,
+    operator.__matmul__: mm_vjp,
+    operator.__mul__: mul_vjp,
     softmax: softmax_vjp,
     relu: relu_vjp,
     transpose: transpose_vjp,
@@ -286,7 +313,7 @@ vjp = {
     d_out10 = rand(11, B)
     g0 = jax.vjp(ffn_flat, W1, b1, W2, b2, x)[1](d_out10)
 
-    g = mod.d_ffn_flat_ssa(W1, b1, W2, b2, x, d_out10)
+    g = mod.d_ffn_flat(W1, b1, W2, b2, x, d_out10)
 
     for g, g0 in zip(g, g0):
         np.testing.assert_allclose(g, g0, atol=1e-5)

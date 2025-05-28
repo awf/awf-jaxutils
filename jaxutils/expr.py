@@ -1841,9 +1841,11 @@ def make_vjp(e, drets):
     def d(v):
         return Var(f"d{v.name}")
 
-    assert isinstance(drets, list), "drets must be a list"
+    def vjp_name(e):
+        assert e.isVar, "vjp_name: e must be a Var"
+        return Var(f"vjp[{e.name}]")
 
-    print("------", drets, e)
+    assert isinstance(drets, list), "drets must be a list"
 
     if e.isConst:
         return [], None
@@ -1862,8 +1864,8 @@ def make_vjp(e, drets):
         #            in
         #              g_tuple(dfv1_1, ..., dfv4_1 + dfv4_2, ... dfv_k_n)
 
-        f_vjp = Var(f"vjp[{e.f}]")
-        dis = [Var(f"_d{i}") for i, arg in enumerate(e.args)]
+        f_vjp = vjp_name(e.f)
+        dis = [Var(f"_d{i}_" + get_new_name()) for i, arg in enumerate(e.args)]
 
         eqns = [Eqn(dis, Call(f_vjp, e.args + drets))]
         fv_contribs = {}
@@ -1872,10 +1874,9 @@ def make_vjp(e, drets):
             if not expr:
                 assert not fvs
                 continue
-            fvs_i = [Var(v.name + "_" + str(i)) for v in fvs]
+            fvs_i = [Var(v.name + "_" + str(i) + "_" + get_new_name()) for v in fvs]
             eqns += [Eqn(fvs_i, expr)]
-            for fv, fv_i in zip(fvs, fvs_i):  # todo comp
-                oplus_(fv_contribs, {fv: fv_i})
+            oplus_(fv_contribs, {fv: fv_i for fv, fv_i in zip(fvs, fvs_i)})
 
         fvs = list(fv_contribs.keys())
         rets = mkTuple(list(fv_contribs.values()))
@@ -1908,35 +1909,49 @@ def make_vjp(e, drets):
 
         fvs_body_0 = [Var(v.name + "_body") for v in fvs_body]
 
-        eqns = e.eqns.copy()
+        # Check there's no name shadowing in this let - code should
+        # work, but hasn't been tested
+        bound_vars = concatlists(eqn.vars for eqn in e.eqns)
+        assert len(set(bound_vars)) == len(bound_vars), "untested"
+
+        eqns = []
+        # Emit vjps for forward pass, and lambdas
+        for eqn in e.eqns:
+            eqns += [Eqn(eqn.vars, eqn.val)]
+            if eqn.val.isLambda:
+                douts = [d(one(eqn.vars))]
+                fvs, dval = make_vjp(eqn.val, douts)
+                eqns += [Eqn(fvs, dval)]
+
+        # Emit vjps for the body
         eqns += [Eqn(fvs_body_0, dbody)]
 
         fv_contribs = {fv: fv_body_0 for fv, fv_body_0 in zip(fvs_body, fvs_body_0)}
 
         for i, eqn in enumerate(reversed(e.eqns)):
-            # Make douts, and remove from contribs if present - they can't be needed
-            # again, as they just came into scope in the primal, so are going out of
-            # scope in the adjoint.
-            douts = []
-            for out in eqn.vars:
-                dout = d(out)
-                if dout in fv_contribs:
-                    douts += [fv_contribs[dout]]
-                    del fv_contribs[dout]
-                else:
-                    douts += [dout]
+            if not eqn.val.isLambda:
+                # Make douts, and remove from contribs if present - they can't be needed
+                # again, as they just came into scope in the primal, so are going out of
+                # scope in the adjoint.
+                douts = []
+                for out in eqn.vars:
+                    dout = d(out)
+                    if dout in fv_contribs:
+                        douts += [fv_contribs[dout]]
+                        del fv_contribs[dout]
+                    else:
+                        douts += [dout]
 
-            # Make the vjp for the rhs
-            fvs, dval = make_vjp(eqn.val, douts)
-            if not dval:
-                assert not fvs
-                continue
+                # Make the vjp for the rhs
+                fvs, dval = make_vjp(eqn.val, douts)
+                if not dval:
+                    assert not fvs
+                    continue
 
-            # Rename the fvs so we can access them in the contribs
-            fvs_i = [Var(v.name + "_" + str(i)) for v in fvs]
-            eqns += [Eqn(fvs_i, dval)]
-            for fv, fv_i in zip(fvs, fvs_i):  # todo
-                oplus_(fv_contribs, {fv: fv_i})
+                # Rename the fvs so we can access them in the contribs
+                fvs_i = [Var(v.name + "_" + str(i)) for v in fvs]
+                eqns += [Eqn(fvs_i, dval)]
+                oplus_(fv_contribs, {fv: fv_i for fv, fv_i in zip(fvs, fvs_i)})
 
         fvs = list(fv_contribs.keys())
         rets = mkTuple(list(fv_contribs.values()))
@@ -1945,11 +1960,16 @@ def make_vjp(e, drets):
         return fvs, ret
 
     if e.isLambda:
-        # D[lambda args: body] =
-        #   lambda args, dret: D[body, dret]
-        assert len(drets) == 0
+        # D[lambda args: body, _drets] =
+        #   [fvs(body)-args], lambda args, dret: D[body, dret]
+        fvs_in = drets
         drets = [Var(f"dret{get_new_name()}")]
-        fvs, dbody = make_vjp(e.body, drets)
-        dargs = [d(arg) if d(arg) in fvs else _zeros_like(arg) for arg in e.args]
-        dbody = Let([Eqn(fvs, dbody)], mkTuple(dargs))
-        return Lambda(e.args + drets, dbody)
+        fvs_body, dbody = make_vjp(e.body, drets)
+        dargs_assigned = [
+            d(arg) if d(arg) in fvs_body else _zeros_like(arg) for arg in e.args
+        ]
+        dbody = Let([Eqn(fvs_body, dbody)], mkTuple(dargs_assigned))
+        dargs = set(d(arg) for arg in e.args)
+        fvs_remaining = [fv for fv in fvs_body if fv not in dargs]
+        assert not fvs_remaining  # need to check that case
+        return fvs_in + fvs_remaining, Lambda(e.args + drets, dbody)
