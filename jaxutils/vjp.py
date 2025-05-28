@@ -171,6 +171,27 @@ def test_mm():
         check(mm, mm_vjp, A, B)
 
 
+# mul
+
+
+def mul(A, B):
+    return A * B
+
+
+def mul_vjp(A, B, dret):
+    # nxk kxm, dret: nxm
+    dA = dret * B
+    dB = A * dret
+    return (dA, dB)
+
+
+def test_mul():
+    A = np.random.randn(13, 7).astype(np.float64)
+    B = np.random.randn(13, 7).astype(np.float64)
+    with jax.default_matmul_precision("highest"):
+        check(mul, mul_vjp, A, B)
+
+
 # dotall
 
 
@@ -314,8 +335,23 @@ def index_vjp(x, i, dret):
 
 def test_index():
     check(
-        lambda x: index(x, 3), lambda x, dret: index_vjp(x, 3, dret), np.random.rand(13)
+        lambda x: index(x, 3),
+        lambda x, dret: index_vjp(x, 3, dret),
+        np.random.rand(13),
     )
+
+
+# transpose
+def transpose(x):
+    return jnp.transpose(x)
+
+
+def transpose_vjp(x, dret):
+    return jnp.transpose(dret)
+
+
+def test_transpose():
+    check(transpose, transpose_vjp, np.random.rand(13, 7))
 
 
 # log

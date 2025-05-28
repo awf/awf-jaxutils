@@ -1,4 +1,5 @@
 # Definitions of global functions used in expr_to_python_code
+import jax.numpy as jnp
 
 
 def g_tuple(*a):
@@ -26,6 +27,10 @@ def g_scan(f, init, xs):
 
 def g_list(*args):
     return list(args)
+
+
+def g_zeros_like(x):
+    return jnp.zeros_like(x)
 
 
 def g_subscript(x, inds):

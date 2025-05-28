@@ -73,7 +73,7 @@ def test_to_ssa():
     print(expr_to_python_code(e, "ssa"))
 
 
-def make_vjp(e: Expr, d_ins: list[Var] = None) -> Expr:
+def make_vjp_ssa(e: Expr, d_ins: list[Var] = None) -> Expr:
     """
     # The python transform:
     def foo(ins1, ins2):
@@ -124,9 +124,9 @@ def make_vjp(e: Expr, d_ins: list[Var] = None) -> Expr:
             assert eqn.val.f.isVar
 
             ins = eqn.val.args
-            d_ins = [make_vjp(v) for v in ins]
+            d_ins = [make_vjp_ssa(v) for v in ins]
             outs = eqn.vars
-            d_outs = [make_vjp(v) for v in outs]
+            d_outs = [make_vjp_ssa(v) for v in outs]
 
             f_vjp = Var(f"vjp[{eqn.val.f.name}]")
             val = Call(f_vjp, ins + d_outs)
@@ -145,10 +145,10 @@ def make_vjp(e: Expr, d_ins: list[Var] = None) -> Expr:
 
             out = lam.body.body
             assert out.isVar
-            d_out = make_vjp(out)
+            d_out = make_vjp_ssa(out)
 
-            d_ins = [make_vjp(v) for v in lam.args]
-            body_vjp = make_vjp(lam.body, d_ins)
+            d_ins = [make_vjp_ssa(v) for v in lam.args]
+            body_vjp = make_vjp_ssa(lam.body, d_ins)
             new_args = lam.args + [d_out]
             new_lam = Lambda(new_args, body_vjp)
 
@@ -174,7 +174,7 @@ def make_vjp(e: Expr, d_ins: list[Var] = None) -> Expr:
         eqn_vjps = [make_for_eqn(eqn) for eqn in reversed(e.eqns)]
         eqns = e.eqns + eqn_vjps
         assert e.body.isVar
-        body = make_vjp(e.body)
+        body = make_vjp_ssa(e.body)
         return Let(eqns, jex.mkTuple(d_ins))
 
     # if e.isLambda:
@@ -221,20 +221,24 @@ def global_getattrs_to_names(e):
     return transform_postorder(transform, e, {})
 
 
-from jaxutils.vjp import softmax, relu
+from jaxutils.vjp import softmax, relu, transpose
 
 
 def ffn_flat(W1, b1, W2, b2, x):
     t1 = W1 @ x + b1
     y1 = relu(t1)
-    y2 = W2 @ y1 + b2
-    return softmax(y2)
+    y2 = transpose(W2) @ W2 @ (y1 * t1)  # + b2
+    return y2
+    # return softmax(y2)
 
 
 from awfutils import import_from_file
 
 
 def test_vjp():
+    W1, b1, W2, b2 = W
+    print(ffn_flat(W1, b1, W2, b2, x))
+
     e = expr_for(ffn_flat)
     print(expr_to_python_code(e, "ffn_flat"))
 
@@ -245,7 +249,8 @@ def test_vjp():
     e = rename_let_v_in_v(e, "ffn_flat_ssa")
     print(expr_to_python_code(e, "ffn_flat_ssa"))
 
-    vjp = make_vjp(e, [Var("d_ffn_flat_ssa")])
+    # vjp = jex.make_vjp(e.eqns[0].val, [])
+    vjp = jex.make_vjp(e.eqns[0].val, [])
     print("\n\n*** VJP ***")
     code = expr_to_python_code(vjp, "d_ffn_flat_ssa")
     print(code)
@@ -253,14 +258,22 @@ def test_vjp():
     with open("tmp/ffn_flat_vjp.py", "w") as f:
         print(
             """
+from jaxutils.expr_lib import g_zeros_like
 import operator as ssa_operator
-from jaxutils.vjp import softmax, relu, add_vjp, mm_vjp, softmax_vjp, relu_vjp
-
+from jaxutils.vjp import (
+    softmax, softmax_vjp, 
+    relu, relu_vjp, 
+    transpose, transpose_vjp,
+    add_vjp, mm_vjp, mul_vjp,
+)
+ 
 vjp = {
     ssa_operator.__add__: add_vjp,
     ssa_operator.__matmul__: mm_vjp,
+    ssa_operator.__mul__: mul_vjp,
     softmax: softmax_vjp,
     relu: relu_vjp,
+    transpose: transpose_vjp,
 }
 """,
             file=f,
@@ -270,10 +283,12 @@ vjp = {
     mod = import_from_file("tmp/ffn_flat_vjp.py", "ffn_flat_vjp")
 
     W1, b1, W2, b2 = W
-    d_out10 = rand(10, B)
+    d_out10 = rand(11, B)
     g0 = jax.vjp(ffn_flat, W1, b1, W2, b2, x)[1](d_out10)
 
     g = mod.d_ffn_flat_ssa(W1, b1, W2, b2, x, d_out10)
 
     for g, g0 in zip(g, g0):
         np.testing.assert_allclose(g, g0, atol=1e-5)
+
+    print("VJPs match")

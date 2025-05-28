@@ -205,6 +205,14 @@ def _subscript(e: Expr, i: int) -> Call:
     return Call(Var("g_subscript"), [e, Const(i)])
 
 
+def _zeros_like(e: Expr) -> Call:
+    return Call(Var("g_zeros_like"), [e])
+
+
+def _add(e1: Expr, e2: Expr) -> Call:
+    return Call(Var("operator.__add__"), [e1, e2])
+
+
 def transform_postorder(transformer: Callable[[Expr, Dict], Expr], *args):
     if len(args) == 0:
         # Make transform(transformer)(e) work like transform(transformer, e)
@@ -1810,3 +1818,138 @@ def rename_let_v_in_v(e, name):
 def expr_to_python_code(e: Expr, name: str) -> str:
     as_ast = to_ast(e, name)
     return astunparse.unparse(as_ast)
+
+
+from typing import Sequence
+
+
+def concatlists(lists: Sequence[List[Any]]) -> List[Any]:
+    """
+    Concatenate a list of lists into a single list.
+    """
+    return [item for sublist in lists for item in sublist]
+
+
+def make_vjp(e, drets):
+    def oplus_(d, d2):
+        for k, v in d2.items():
+            if k in d:
+                d[k] = _add(d[k], v)
+            else:
+                d[k] = v
+
+    def d(v):
+        return Var(f"d{v.name}")
+
+    assert isinstance(drets, list), "drets must be a list"
+
+    print("------", drets, e)
+
+    if e.isConst:
+        return [], None
+
+    if e.isVar:
+        return [d(e)], mkTuple(drets)
+
+    if e.isCall:
+        # D[e, drets] = pair of (d[freevars] : list of Var, val: Expr in fvs, drets returning tuple of vals)
+        # D[f(arg1, ..., argn)] =
+        #  [d(fvs)], let
+        #              _d1, ..., _dn = vjp[f](arg1, ..., argn, dret)
+        #              dfv1_1, dfv4_1, dfvk_1 = D[arg1, _d1] # This eqn contribs to fv1, fv4, fvk
+        #              ...
+        #              dfv2_2, dfv4_2, dfv7_2 = D[argn, _dn]
+        #            in
+        #              g_tuple(dfv1_1, ..., dfv4_1 + dfv4_2, ... dfv_k_n)
+
+        f_vjp = Var(f"vjp[{e.f}]")
+        dis = [Var(f"_d{i}") for i, arg in enumerate(e.args)]
+
+        eqns = [Eqn(dis, Call(f_vjp, e.args + drets))]
+        fv_contribs = {}
+        for i, (arg, di) in enumerate(zip(e.args, dis)):
+            fvs, expr = make_vjp(arg, [di])
+            if not expr:
+                assert not fvs
+                continue
+            fvs_i = [Var(v.name + "_" + str(i)) for v in fvs]
+            eqns += [Eqn(fvs_i, expr)]
+            for fv, fv_i in zip(fvs, fvs_i):  # todo comp
+                oplus_(fv_contribs, {fv: fv_i})
+
+        fvs = list(fv_contribs.keys())
+        rets = mkTuple(list(fv_contribs.values()))
+        ret = Let(eqns, rets)
+
+        return fvs, ret
+
+    if e.isLet:
+        # D[let
+        #     vs1 = e1
+        #     vs2 = e2
+        #   in
+        #     body
+        #   ] =
+        #
+        # [fvs(e)], let
+        #             vs1 = e1
+        #             vs2 = e2
+        #             dfvs_body = D[body, dret]  # map fvs of body (say vs2, vs1, g) to contribs
+        #
+        #             dfvs_e2 = D[e2, dvs2]   # mapping from freevars of e2 (say vs1, g) to diffs
+        #                                     # TODO?: update all of those here
+        #             dfvs_e1 = D[e1, dvs1]   # mapping from freevars of e1 to diffs
+        #           in
+        #             osum(dfvs_body, dfvs_e2, dfvs_e1)
+        fvs_body, dbody = make_vjp(e.body, drets)
+        if not dbody:
+            # Whole let is constant, return
+            return [], None
+
+        fvs_body_0 = [Var(v.name + "_body") for v in fvs_body]
+
+        eqns = e.eqns.copy()
+        eqns += [Eqn(fvs_body_0, dbody)]
+
+        fv_contribs = {fv: fv_body_0 for fv, fv_body_0 in zip(fvs_body, fvs_body_0)}
+
+        for i, eqn in enumerate(reversed(e.eqns)):
+            # Make douts, and remove from contribs if present - they can't be needed
+            # again, as they just came into scope in the primal, so are going out of
+            # scope in the adjoint.
+            douts = []
+            for out in eqn.vars:
+                dout = d(out)
+                if dout in fv_contribs:
+                    douts += [fv_contribs[dout]]
+                    del fv_contribs[dout]
+                else:
+                    douts += [dout]
+
+            # Make the vjp for the rhs
+            fvs, dval = make_vjp(eqn.val, douts)
+            if not dval:
+                assert not fvs
+                continue
+
+            # Rename the fvs so we can access them in the contribs
+            fvs_i = [Var(v.name + "_" + str(i)) for v in fvs]
+            eqns += [Eqn(fvs_i, dval)]
+            for fv, fv_i in zip(fvs, fvs_i):  # todo
+                oplus_(fv_contribs, {fv: fv_i})
+
+        fvs = list(fv_contribs.keys())
+        rets = mkTuple(list(fv_contribs.values()))
+        ret = Let(eqns, rets)
+
+        return fvs, ret
+
+    if e.isLambda:
+        # D[lambda args: body] =
+        #   lambda args, dret: D[body, dret]
+        assert len(drets) == 0
+        drets = [Var(f"dret{get_new_name()}")]
+        fvs, dbody = make_vjp(e.body, drets)
+        dargs = [d(arg) if d(arg) in fvs else _zeros_like(arg) for arg in e.args]
+        dbody = Let([Eqn(fvs, dbody)], mkTuple(dargs))
+        return Lambda(e.args + drets, dbody)
