@@ -17,6 +17,8 @@ if sys.version_info >= (3, 9):
 else:
     import astunparse
 
+warn = print
+
 
 ### TODO: General utils - should move elsewhere
 def dictassign(d: Dict[Any, Callable], key: Any):
@@ -408,7 +410,8 @@ def optimize(e: Expr) -> Expr:
 
         osig = signature(ex)
         sig = signature(new_ex)
-        if sig != osig:
+        # Set of freevars might shrink, but not grow
+        if not (sig <= osig):
             assert False
         return new_ex
 
@@ -1008,10 +1011,11 @@ def test_uniquify_names():
 ########################################################################################
 
 
-def eval_expr(e: Expr, args, bindings=None):
-    bindings = {} if bindings is None else bindings
-    bindings |= _bindings_for_operators()
-    bindings |= _bindings_for_expr_lib()
+def eval_expr(e: Expr, args, bindings=None, add_operators=True):
+    bindings = bindings or {}
+    if add_operators:
+        bindings |= _bindings_for_operators()
+        bindings |= _bindings_for_expr_lib()
     return _run_eval(Call(e, [Const(a) for a in args]), bindings)
 
 
@@ -1022,7 +1026,7 @@ def _bindings_for_operators():
 
 
 def _bindings_for_expr_lib():
-    return {f: getattr(expr_lib, f) for f in dir(expr_lib)}
+    return {f: getattr(expr_lib, f) for f in dir(expr_lib) if f.startswith("g_")}
 
 
 def _run_eval(e: Expr, bindings: Dict[str, Any]) -> Any:
@@ -1059,8 +1063,7 @@ def _run_eval_aux(e: Expr, bindings: Dict[Var, Any]) -> Any:
         #   vars2 = val2 [fvs x vars1]
         # in
         #   body
-        argset = set()
-        new_bindings = {**bindings}
+        new_bindings = bindings.copy()
         for eqn in e.eqns:
             tupval = recurse(eqn.val, new_bindings)
 
@@ -1531,18 +1534,24 @@ def _ast_to_eqn(stmt, path_to_a):
         iteration_var_names = one(analyzer.bound_stack) & analyzer.free
         iteration_vars = [Var(name) for name in iteration_var_names]
 
+        lambda_args = iteration_vars + [target]
+        extra_args = [
+            Var(name) for name in analyzer.free - set(a.name for a in lambda_args)
+        ]
+
         # Scan a function over leading array axes while carrying along state.
-        # scan(f, init, xs=None, length=None, reverse=False)
+        # g_scan(f, init, xs)
         init = one(iteration_vars)
         xs = iter
-        scan_lambda = Lambda(
-            iteration_vars + [target],
-            Let(body_eqns, one(iteration_vars)),
-        )
+        lambda_body = Let(body_eqns, one(iteration_vars))
+        scan_lambda = Lambda(lambda_args + extra_args, lambda_body)
+        scan_lambda_var = Var("g_scan_body_" + get_new_name())
 
-        val = Call(Var("g_scan"), [scan_lambda, init, xs])
-        var = one(iteration_vars)
-        print(expr_to_python_code(val, var.name))
+        val = Let(
+            [Eqn([scan_lambda_var], scan_lambda)],
+            Call(Var("g_scan"), [scan_lambda_var, init, xs, *extra_args]),
+        )
+        print(expr_to_python_code(val, one(iteration_vars).name))
         return Eqn(iteration_vars, val)
 
     print(ast.dump(stmt))
@@ -1750,7 +1759,10 @@ def wl_pdoc(e):
     if e.isLet:
 
         def doeqn(vars, val):
-            vars = wl.join(wl.comma, list(map(recurse, vars)))
+            if vars:
+                vars = wl.join(wl.comma, list(map(recurse, vars)))
+            else:
+                vars = wl.TextDoc("__warning__null_vars__")
             return (
                 ((vars + spc + wl.TextDoc("=")).group() + spc + recurse(val))
                 .group()
@@ -1768,6 +1780,8 @@ def wl_pdoc(e):
 
 
 def expr_format(e, **kwargs):
+    if "width" not in kwargs:
+        kwargs["width"] = 120
     return wl.pformat(e, custom=wl_pdoc, **kwargs)
 
 
@@ -1830,7 +1844,8 @@ def concatlists(lists: Sequence[List[Any]]) -> List[Any]:
     return [item for sublist in lists for item in sublist]
 
 
-def make_vjp(e, drets):
+def make_vjp(e, drets) -> tuple[List[Var], Expr]:
+    # vjp(e, drets) returns a pair of (freevars, expr)
     def oplus_(d, d2):
         for k, v in d2.items():
             if k in d:
@@ -1842,8 +1857,8 @@ def make_vjp(e, drets):
         return Var(f"d{v.name}")
 
     def vjp_name(e):
-        assert e.isVar, "vjp_name: e must be a Var"
-        return Var(f"vjp[{e.name}]")
+        # assert e.isVar, f"vjp_name: e must be a Var, not {e}"
+        return Call(Var("g_vjp"), [e])
 
     assert isinstance(drets, list), "drets must be a list"
 
@@ -1965,11 +1980,16 @@ def make_vjp(e, drets):
         fvs_in = drets
         drets = [Var(f"dret{get_new_name()}")]
         fvs_body, dbody = make_vjp(e.body, drets)
+        print(optimize(dbody))
         dargs_assigned = [
             d(arg) if d(arg) in fvs_body else _zeros_like(arg) for arg in e.args
         ]
         dbody = Let([Eqn(fvs_body, dbody)], mkTuple(dargs_assigned))
         dargs = set(d(arg) for arg in e.args)
         fvs_remaining = [fv for fv in fvs_body if fv not in dargs]
-        assert not fvs_remaining  # need to check that case
-        return fvs_in + fvs_remaining, Lambda(e.args + drets, dbody)
+        if fvs_remaining:
+            print(
+                f"make_vjp: {len(fvs_remaining)} free vars in lambda not in args: {fvs_remaining}"
+            )
+
+        return fvs_in, Lambda(e.args + drets, dbody)

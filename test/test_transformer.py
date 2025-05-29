@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxutils.ParamsDict import ParamsDict
-
+import jaxutils.expr as jex
 
 # Frozen copy of https://github.com/awf/functional-transformer
 
@@ -80,6 +80,10 @@ def standardize_rows(x):
     return jax.vmap(standardize, in_axes=(0, None))(x, 1e-5)
 
 
+def softmax(x):
+    return jax.nn.softmax(x, axis=1)
+
+
 # Format off for the size annotations
 # fmt: off
 def transformer(cfg, params, x):
@@ -124,7 +128,7 @@ def transformer(cfg, params, x):
 
             # Compute L x L attention matrix
             score = query @ key.T + mask
-            attn = jax.nn.softmax(cfg.tau * score, axis=1)
+            attn = softmax(cfg.tau * score)
 
             value = t1 @ head.value
             self_attn = attn @ value
@@ -251,3 +255,69 @@ import jax.numpy as jnp
     cfg, params, x = _make_test_data()
     loss = transformer_loss(cfg, params, x, module.transformer)
     np.testing.assert_almost_equal(loss, 3.107, decimal=3)
+
+
+from jaxutils.expr import Var, Call, Const
+
+
+def resolve_getattr(e, bindings=None):
+    def doit(e, bindings):
+        if e.isCall and e.f == Var("getattr"):
+            obj, attr = e.args
+            if obj.isVar and attr.isConst:
+                attr = attr.val
+                if attr == "T":
+                    return Call(Var("g_transpose"), [obj])
+                elif obj.name in bindings:
+                    val = bindings[obj.name]
+                    if isinstance(val, types.ModuleType):
+                        return Var(f"{val.__name__}.{attr}")
+            pass
+
+    return jex.transform_postorder(doit, e, bindings or {})
+
+
+def mkcall(name: str):
+    return lambda *args: (name, *args)
+
+
+def my_getattr(obj, attr):
+    if isinstance(obj, types.ModuleType):
+        return mkcall(f"{obj.__name__}.{attr}")
+    else:
+        return mkcall("getattr")(obj, attr)
+
+    #  g_pairs_to_dict,jax,print,standardize_rows
+
+
+def test_transformer_vjp():
+    e = expr_for(transformer)
+    cfg, params, x = _make_test_data()
+
+    # bindings = dict(
+    #     jax=jax,
+    #     jnp=jnp,
+    #     standardize_rows=mkcall("standardize_rows"),
+    #     softmax=mkcall("softmax"),
+    #     print=print,
+    # )
+    # bindings |= {k: mkcall(k) for k in jex._bindings_for_operators()}
+    # bindings |= {k: mkcall(k) for k in jex._bindings_for_expr_lib()}
+    # bindings["getattr"] = my_getattr
+    # bindings["**g_pairs_to_dict"] = mkcall("g_pairs_to_dict")
+    # e2 = jex.eval_expr(e, (cfg, Var("params"), Var("x")), bindings, add_operators=False)
+    # print(e2)
+
+    # bindings = {"jax": jax, "jnp": jnp, "jax.nn": jax.nn}
+    # e = resolve_getattr(e, bindings)
+
+    e = jex.uniquify_names(e)
+    vars, vjp = jex.make_vjp(e, [jex.Var("f")])
+
+    with open("tmp/transformer_vjp.py", "w") as f:
+        print(expr_to_python_code(vjp, "transformer_vjp"), file=f)
+
+    vjpo = jex.optimize(vjp)
+
+    with open("tmp/transformer_vjpo.py", "w") as f:
+        print(expr_to_python_code(vjpo, "transformer_vjpo"), file=f)

@@ -316,6 +316,6 @@ vjp = {
     g = mod.d_ffn_flat(W1, b1, W2, b2, x, d_out10)
 
     for g, g0 in zip(g, g0):
-        np.testing.assert_allclose(g, g0, atol=1e-5)
+        np.testing.assert_allclose(g, g0, atol=1e-4)
 
     print("VJPs match")

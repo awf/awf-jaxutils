@@ -18,10 +18,10 @@ def g_pairs_to_dict(*pairs):
 g_slice = slice
 
 
-def g_scan(f, init, xs):
+def g_scan(f, init, xs, *args):
     carry = init
     for x in xs:
-        carry = f(carry, x)
+        carry = f(carry, x, *args)
     return carry
 
 
