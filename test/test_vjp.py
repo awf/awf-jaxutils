@@ -302,6 +302,9 @@ vjp = {
     relu: relu_vjp,
     transpose: transpose_vjp,
 }
+
+def g_vjp(f):
+    return vjp[f]
 """,
             file=f,
         )
