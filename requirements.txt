@@ -1,8 +1,9 @@
 jax
 jaxlib
-astpretty
-prettyprinter
 icecream
 labml
 pytest
 black
+astunparse
+beartype
+more_itertools

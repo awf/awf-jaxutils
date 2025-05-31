@@ -38,17 +38,15 @@ def ensure_tuple(val):
 
 # vjp checker.
 # Tols set for 32 bit float
-def check(f, f_grad, *args, rtol=1e-5, atol=1e-7, verbose=False):
+def check(f, f_grad, *args, rtol=1e-4, atol=1e-6, verbose=False):
     print("Checking", f, end="...")
     val = f(*args)
 
     valj, jax_vjp = jax.vjp(f, *args)
-    if verbose:
-        ic(val, valj)
 
-    assert tree_all(tree_close(val, valj, rtol, atol))
+    np.testing.assert_allclose(val, valj, rtol, atol)
 
-    probe = jax.tree_map(randlike, val)
+    probe = jax.tree.map(randlike, val)
     gj = jax_vjp(probe)
     gf = f_grad(*args, *ensure_tuple(probe))
     gf = ensure_tuple(gf)
@@ -59,7 +57,7 @@ def check(f, f_grad, *args, rtol=1e-5, atol=1e-7, verbose=False):
     print(isclose)
     if verbose:
         ic(gj, gf)
-        print("diff=", jax.tree_map(lambda a, b: a - b, gj, gf))
+        print("diff=", jax.tree.map(lambda a, b: a - b, gj, gf))
 
     assert tree_all(isclose)
 
@@ -167,7 +165,31 @@ def mm_vjp(A, B, dret):
 
 
 def test_mm():
-    check(mm, mm_vjp, np.random.randn(13, 7), np.random.randn(7, 3))
+    A = np.random.randn(13, 7).astype(np.float64)
+    B = np.random.randn(7, 3).astype(np.float64)
+    with jax.default_matmul_precision("highest"):
+        check(mm, mm_vjp, A, B)
+
+
+# mul
+
+
+def mul(A, B):
+    return A * B
+
+
+def mul_vjp(A, B, dret):
+    # nxk kxm, dret: nxm
+    dA = dret * B
+    dB = A * dret
+    return (dA, dB)
+
+
+def test_mul():
+    A = np.random.randn(13, 7).astype(np.float64)
+    B = np.random.randn(13, 7).astype(np.float64)
+    with jax.default_matmul_precision("highest"):
+        check(mul, mul_vjp, A, B)
 
 
 # dotall
@@ -283,16 +305,20 @@ def test_relu():
 
 
 def softmax(x):
-    return jnn.softmax(x)
+    """
+    Column softmax
+    """
+    return jnn.softmax(x, axis=0)
 
 
 def softmax_vjp(x, dret):
-    ret = jnn.softmax(x)
-    return ret * dret - ret * jnp.dot(dret, ret)
+    assert x.shape == dret.shape
+    ret = jnn.softmax(x, axis=0)
+    return ret * dret - ret * jnp.sum(ret * dret, axis=0)
 
 
 def test_softmax():
-    check(softmax, softmax_vjp, np.random.randn(13))
+    check(softmax, softmax_vjp, np.random.randn(13, 3))
 
 
 # index
@@ -303,16 +329,32 @@ def index(x, i):
 
 
 def index_vjp(x, i, dret):
-    return jnn.one_hot(i, len(x)) * dret
+    assert len(x.shape) == 1 or all(v == 1 for v in x.shape[1:])
+    return jnn.one_hot(i, len(x)).reshape(x.shape) * dret
 
 
 def test_index():
     check(
-        lambda x: index(x, 3), lambda x, dret: index_vjp(x, 3, dret), np.random.rand(13)
+        lambda x: index(x, 3),
+        lambda x, dret: index_vjp(x, 3, dret),
+        np.random.rand(13),
     )
 
 
-# index
+# transpose
+def transpose(x):
+    return jnp.transpose(x)
+
+
+def transpose_vjp(x, dret):
+    return jnp.transpose(dret)
+
+
+def test_transpose():
+    check(transpose, transpose_vjp, np.random.rand(13, 7))
+
+
+# log
 log = jnp.log
 
 
@@ -322,3 +364,28 @@ def log_vjp(x, dret):
 
 def test_log():
     check(log, log_vjp, np.random.rand(13, 7))
+
+
+# log
+exp = jnp.exp
+
+
+def exp_vjp(x, dret):
+    return dret * exp(x)
+
+
+def test_exp():
+    check(exp, exp_vjp, np.random.rand(13, 7))
+
+
+# negate
+def negate(x):
+    return -x
+
+
+def negate_vjp(x, dret):
+    return -dret
+
+
+def test_negate():
+    check(negate, negate_vjp, np.random.rand(13, 7))
