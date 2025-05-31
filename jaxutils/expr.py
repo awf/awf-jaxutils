@@ -2,7 +2,17 @@ import sys
 import enum
 from dataclasses import dataclass
 from beartype import beartype
-from beartype.typing import List, Set, Any, Tuple, Dict, List, Callable, Optional
+from beartype.typing import (
+    List,
+    Set,
+    Any,
+    Tuple,
+    Dict,
+    Sequence,
+    List,
+    Callable,
+    Optional,
+)
 from pprint import pprint
 from itertools import chain
 from more_itertools import one
@@ -103,6 +113,7 @@ def reset_new_name_ids():
 
 
 @beartype
+@dataclass(frozen=True)
 class Expr:
     """
     A classic tiny-Expr library.
@@ -155,14 +166,19 @@ def exprclass(klass, **kwargs):
     return beartype(dataclass(klass, frozen=True, **kwargs))
 
 
+# TODO: Add "annot" more DRYly
+
+
 @exprclass
 class Const(Expr):
     val: Any
+    annot: Any = None  # Optional annotation, e.g. for type information
 
 
 @exprclass
 class Var(Expr):
     name: str
+    annot: Any = None  # Optional annotation, e.g. for type information
 
 
 @exprclass
@@ -175,18 +191,25 @@ class Eqn:
 class Let(Expr):
     eqns: List[Eqn]
     body: Expr
+    annot: Any = None  # Optional annotation, e.g. for type information
+
+
+LambdaId = str
 
 
 @exprclass
 class Lambda(Expr):
     args: List[Var]
     body: Expr
+    id: LambdaId  # Lambdas cannot be created or destroyed, just converted from one form...
+    annot: Any = None  # Optional annotation, e.g. for type information
 
 
 @exprclass
 class Call(Expr):
     f: Expr
     args: List[Expr]
+    annot: Any = None  # Optional annotation, e.g. for type information
 
 
 def mkvars(s: str) -> Tuple[Var]:
@@ -215,12 +238,12 @@ def _add(e1: Expr, e2: Expr) -> Call:
     return Call(Var("operator.__add__"), [e1, e2])
 
 
-def transform_postorder(transformer: Callable[[Expr, Dict], Expr], *args):
+def transform_postorder(name: str, transformer: Callable[[Expr, Dict], Expr], *args):
     if len(args) == 0:
-        # Make transform(transformer)(e) work like transform(transformer, e)
-        return lambda *args: transform_postorder(transformer, *args)
+        # Make transform(name, transformer)(e) work like transform(transformer, e)
+        return lambda *args: transform_postorder(name, transformer, *args)
 
-    recurse = lambda e, bindings: transform_postorder(transformer, e, bindings)
+    recurse = lambda e, bindings: transform_postorder(name, transformer, e, bindings)
 
     e, bindings = args
 
@@ -241,19 +264,19 @@ def transform_postorder(transformer: Callable[[Expr, Dict], Expr], *args):
                     new_bindings[var.name] = _subscript(new_val, i)
 
         new_body = recurse(e.body, new_bindings)
-        e = Let(new_eqns, new_body)
+        e = Let(new_eqns, new_body, annot=new_body.annot)
 
     if e.isLambda:
         new_bindings = bindings.copy()
         for arg in e.args:
             new_bindings[arg.name] = None
         new_body = recurse(e.body, new_bindings)
-        e = Lambda(e.args, new_body)
+        e = Lambda(e.args, new_body, e.id + "/" + name, annot=new_body.annot)
 
     if e.isCall:
         new_f = recurse(e.f, bindings)
         new_args = [recurse(arg, bindings) for arg in e.args]
-        e = Call(new_f, new_args)
+        e = Call(new_f, new_args, annot=e.annot)
 
     # And pass self to the transformer, with updated children
     return transformer(e, bindings) or e
@@ -354,13 +377,6 @@ def kwargs_to_dict_call(dict):
     return [Call(Var("**g_pairs_to_dict"), list(chain(*dict_pairs)))]
 
 
-def new_call(fn: str, *args, **kwargs):
-    """
-    Convenience function to make a Call node from a string, args, and kwargs
-    """
-    return Call(Var(fn), list(args) + kwargs_to_dict_call(kwargs))
-
-
 ########################################################################################
 #
 #
@@ -399,7 +415,9 @@ def optimize(e: Expr) -> Expr:
         if not transformation:
             if transformation_name.startswith("t-"):
                 transformation = globals()[transformation_name[2:]]
-                transformation = transform_postorder(transformation)
+                transformation = transform_postorder(
+                    transformation_name, transformation
+                )
             else:
                 transformation = globals()[transformation_name]
 
@@ -429,14 +447,14 @@ def optimize(e: Expr) -> Expr:
         identify_identities,
         eliminate_identities,
     ):
-        e = run("t-" + t.__name__, e, transform_postorder(t))
+        e = run("t-" + t.__name__, e, transform_postorder(t.__name__, t))
 
     e = run("to_anf", e)
     e = run("t-detuple_tuple_assignments", e)
     e = run("inline_trivial_assignments", e)
 
     for t in (eliminate_identities,):
-        e = run("t-" + t.__name__, e, transform_postorder(t))
+        e = run("t-" + t.__name__, e, transform_postorder(t.__name__, t))
 
     e = run("inline_trivial_assignments", e)
 
@@ -556,7 +574,7 @@ def inline_single_usages(e: Expr) -> Expr:
             for arg in e.args:
                 inner_var_to_val[arg.name] = arg
             body = recurse(e.body, inner_var_to_val)
-            return Lambda(e.args, body)
+            return Lambda(e.args, body, e.id + "/isu")
 
         assert False
 
@@ -614,7 +632,7 @@ def dce(e: Expr) -> Expr:
             for arg in e.args:
                 local_var_to_count[arg.name] = 0
             body = recurse(e.body, local_var_to_count)
-            return Lambda(e.args, body)
+            return Lambda(e.args, body, e.id + "/dce")
 
         assert False
 
@@ -653,7 +671,7 @@ def detuple_lets(e: Expr) -> Expr:
         new_eqns = list(chain(*map(detuple_eqn, e.eqns)))
         return Let(new_eqns, e.body)
 
-    return transform_postorder(doit, e, {})
+    return transform_postorder("detuple_lets", doit, e, {})
 
 
 def detuple_tuple_assignments(e: Expr, bindings: Dict[str, Any]) -> Expr:
@@ -733,7 +751,7 @@ def to_anf_aux(e, assignments, bindings):
         return abody
 
     if e.isLambda:
-        return Lambda(e.args, to_anf(e.body, bindings))
+        return Lambda(e.args, to_anf(e.body, bindings), e.id + "/anf")
 
     if e.isCall:
         new_f = to_anf_aux(e.f, assignments, bindings)
@@ -802,7 +820,7 @@ def inline_trivial_assignments_aux(e: Expr, translations: Dict[Var, Expr]):
         }
         assert all(v not in new_translations for v in e.args)
         new_body = recurse(e.body, new_translations)
-        return Lambda(e.args, new_body)
+        return Lambda(e.args, new_body, e.id + "/ita")
 
     if e.isCall:
         new_f = recurse(e.f, translations)
@@ -850,7 +868,7 @@ def let_to_lambda(e: Expr, bindings: Dict[str, Any]) -> Expr:
             args += eqn.vars
             vals += [eqn.val]
 
-        return Call(Lambda(args, e.body), vals)
+        return Call(Lambda(args, e.body, "l2l_" + get_new_name()), vals)
 
 
 def elide_empty_lhs(e: Expr, bindings: Dict[str, Any]) -> Expr:
@@ -944,7 +962,7 @@ def uniquify_names(e: Expr, reset_ids: bool = False) -> Expr:
                 new_vars.append(Var(newname))
 
             new_body = doit(e.body, new_translations)
-            return Lambda(new_vars, new_body)
+            return Lambda(new_vars, new_body, e.id + "/unq")
 
         if e.isLet:
             new_translations = {**translations}
@@ -1079,8 +1097,11 @@ def _run_eval_aux(e: Expr, bindings: Dict[Var, Any]) -> Any:
 
     if e.isLambda:
 
+        # TODO: Lexical scope?
+
         def runLambda(e, vals, bindings):
             argset = {v.name for v in e.args}
+
             new_bindings = {
                 name: val for (name, val) in bindings.items() if name not in argset
             }
@@ -1092,6 +1113,170 @@ def _run_eval_aux(e: Expr, bindings: Dict[Var, Any]) -> Any:
         return lambda *vals: runLambda(e, vals, bindings)
 
     assert False
+
+
+########################################################################################
+#
+#
+#          db                                                   88888888888                    88
+#         d88b                                            ,d    88                             88
+#        d8'`8b                                           88    88                             88
+#       d8'  `8b     8b,dPPYba,  8b,dPPYba,   ,adPPYba, MM88MMM 88aaaaa 8b       d8 ,adPPYYba, 88
+#      d8YaaaaY8b    88P'   `"8a 88P'   `"8a a8"     "8a  88    88""""" `8b     d8' ""     `Y8 88
+#     d8""""""""8b   88       88 88       88 8b       d8  88    88       `8b   d8'  ,adPPPPP88 88
+#    d8'        `8b  88       88 88       88 "8a,   ,a8"  88,   88        `8b,d8'   88,    ,88 88
+#   d8'          `8b 88       88 88       88  `"YbbdP"'   "Y888 88888888888 "8"     `"8bbdP"Y8 88
+#
+#
+########################################################################################
+
+
+@beartype
+def annotate_eval(
+    e: Expr, args: Sequence[Any], bindings: Dict[str, Any], add_operators=True
+) -> Expr:
+    """
+    Evalute the expression `e` with the given `args`, and annotate all expr nodes
+    with their evaluated values.
+
+    This can be used to annotate an expression with types or other
+    information.
+    """
+    if add_operators:
+        bindings |= _bindings_for_operators()
+        bindings |= _bindings_for_expr_lib()
+
+    annotated_lambdas: Dict[int, Lambda] = {}
+
+    call = Call(e, [Const(a) for a in args])
+
+    e1 = _annotate_eval_aux(call, bindings, annotated_lambdas, cache_calls=True)
+
+    e2 = _annotate_eval_lookup_lambdas(e1, annotated_lambdas)
+
+    return e2
+
+
+@beartype
+def _annotate_eval_aux(
+    e: Expr,
+    bindings: Dict[str, Any],
+    annotated_lambdas: Dict[LambdaId, Lambda],
+    cache_calls: bool,
+) -> Expr:
+
+    recurse = lambda e, b: _annotate_eval_aux(e, b, annotated_lambdas, cache_calls)
+
+    if e.isConst:
+        return Const(e.val, annot=e.val)
+
+    if e.isVar:
+        if e.name not in bindings:
+            raise ValueError(f"Unbound variable {e.name}")
+        return Var(e.name, annot=bindings[e.name])
+
+    if e.isLet:
+        # let
+        #   vars1 = val1 [fvs x]
+        #   vars2 = val2 [fvs x vars1]
+        # in
+        #   body
+        new_bindings = bindings.copy()
+        new_eqns = []
+        for eqn in e.eqns:
+            new_val = recurse(eqn.val, new_bindings)
+
+            var = one(eqn.vars)  # No Expr tuple so need to detuple_lets first
+            new_bindings[var.name] = new_val.annot
+            new_vars = [Var(var.name, annot=new_val.annot)]
+
+            new_eqns += [Eqn(new_vars, new_val)]
+
+        new_body = recurse(e.body, new_bindings)
+        return Let(new_eqns, new_body, annot=new_body.annot)
+
+    if e.isCall:
+        new_f = recurse(e.f, bindings)
+        new_args = [recurse(arg, bindings) for arg in e.args]
+
+        new_f_val = new_f.annot
+        assert isinstance(new_f_val, Callable)
+        val = new_f_val(*(arg.annot for arg in new_args))
+        return Call(new_f, new_args, annot=val)
+
+    if e.isLambda:
+
+        lam = e
+        lam_id = e.id
+        lam_argset = {v.name for v in lam.args}
+
+        run_lambda = None
+        if lam_id in annotated_lambdas and cache_calls:
+            # We've already run this one...
+            # Just return a trivial lambda
+            print(f"Using cached call to {lam_id}")
+            val = annotated_lambdas[lam_id].annot
+            run_lambda = lambda *args: val
+        else:
+
+            def runLambda(*arg_vals) -> Any:
+                new_bindings = {
+                    name: val
+                    for (name, val) in bindings.items()
+                    if name not in lam_argset
+                }
+                new_args = []
+                for var, val in zip(lam.args, arg_vals):
+                    new_bindings[var.name] = val
+                    new_args += [Var(var.name, annot=val)]
+
+                new_body = recurse(lam.body, new_bindings)
+                new_lam = Lambda(
+                    new_args, new_body, lam_id + "/ata", annot=new_body.annot
+                )
+                annotated_lambdas[lam_id] = new_lam
+
+                # Now we know that running this lambda with these args produced "ret"
+                msg = (
+                    f"Ran lam {lam_id} with args {list(shortstr(a) for a in arg_vals)}"
+                )
+                print(f"{msg} -> {shortstr(new_body.annot)}")
+
+                return new_body.annot
+
+            run_lambda = runLambda
+
+        # The value of a lambda is the expr
+        return Lambda(e.args, e.body, e.id, annot=run_lambda)
+
+    assert False
+
+
+def _annotate_eval_lookup_lambdas(e: Expr, annotated_lambdas) -> Expr:
+    recurse = lambda e: _annotate_eval_lookup_lambdas(e, annotated_lambdas)
+
+    if e.isConst or e.isVar:
+        return e
+
+    if e.isLet:
+        new_eqns = [Eqn(eqn.vars, recurse(eqn.val)) for eqn in e.eqns]
+        new_body = recurse(e.body)
+        return Let(new_eqns, new_body, annot=new_body.annot)
+
+    if e.isCall:
+        new_f = recurse(e.f)
+        new_args = list(map(recurse, e.args))
+        return Call(new_f, new_args, annot=e.annot)
+
+    if e.isLambda:
+        lam_id = e.id
+        if lam_id.endswith("/lookup_lambdas"):
+            lam_id = lam_id[: -len("/lookup_lambdas")]
+        assert e.annot is not None or lam_id in annotated_lambdas
+        new_e = annotated_lambdas[lam_id]
+        new_body = recurse(new_e.body)
+        new_e = Lambda(new_e.args, new_body, id=e.id + "/ll", annot=new_e.annot)
+        return new_e
 
 
 ########################################################################################
@@ -1223,7 +1408,7 @@ class _RewriteDictCallToSplat(ast.NodeTransformer):
 
 @beartype
 def to_ast_args(vars: List[Var]) -> ast.arguments:
-    aargs = [ast.arg(v.name, annotation=None) for v in vars]
+    aargs = [ast.arg(v.name, annotation=mkannot(v)) for v in vars]
     return ast.arguments(
         args=aargs,
         vararg=None,
@@ -1251,6 +1436,17 @@ def to_ast_constant(val):
     return ast_expr.value
 
 
+def shortstr(v: Any):
+    return type(v).__name__
+
+
+def mkannot(e):
+    if e.annot is not None:
+        return ast.Name(shortstr(e.annot), ast.Load())
+    else:
+        return None
+
+
 def to_ast_aux(e, assignments, binders=None):
     if e.isConst:
         return to_ast_constant(e.val)
@@ -1265,7 +1461,17 @@ def to_ast_aux(e, assignments, binders=None):
                 avars = [ast.Tuple(avars, ast.Store())]
 
             if aval := to_ast_aux(eqn.val, assignments, binders=eqn.vars):
-                assignments += [ast.Assign(targets=avars, value=aval)]
+                if eqn.val.annot is not None:
+                    assignments += [
+                        ast.AnnAssign(
+                            target=one(avars),
+                            value=aval,
+                            annotation=mkannot(eqn.val),
+                            simple=1,
+                        )
+                    ]
+                else:
+                    assignments += [ast.Assign(targets=avars, value=aval)]
 
         abody = to_ast_aux(e.body, assignments)
         return abody
@@ -1422,7 +1628,7 @@ def ast_to_expr(a: Optional[ast.AST], path_to_a: List[Optional[ast.AST]]):
         return Let([eqn], mkTuple(eqn.vars))
 
     if isinstance(a, ast.Lambda):
-        return Lambda(recurse(a.args), recurse(a.body))
+        return Lambda(recurse(a.args), recurse(a.body), "ast:" + get_new_name())
 
     if isinstance(a, ast.Constant):
         return Const(a.value)
@@ -1492,7 +1698,7 @@ def _ast_to_eqn(stmt, path_to_a):
         retval = recurse(stmt.body[-1].value)
 
         body = Let(eqns, retval)
-        lam = Lambda(args, body)
+        lam = Lambda(args, body, "ast:" + stmt.name + get_new_name())
         return Eqn([Var(stmt.name)], lam)
 
     if isinstance(stmt, ast.Assign):
@@ -1544,8 +1750,9 @@ def _ast_to_eqn(stmt, path_to_a):
         init = one(iteration_vars)
         xs = iter
         lambda_body = Let(body_eqns, one(iteration_vars))
-        scan_lambda = Lambda(lambda_args + extra_args, lambda_body)
-        scan_lambda_var = Var("g_scan_body_" + get_new_name())
+        lambda_id = "for_body_" + get_new_name()
+        scan_lambda = Lambda(lambda_args + extra_args, lambda_body, lambda_id)
+        scan_lambda_var = Var(lambda_id)
 
         val = Let(
             [Eqn([scan_lambda_var], scan_lambda)],
@@ -1582,7 +1789,7 @@ def to_ssa(e: Expr) -> Let | Var | Const | Lambda:
         return e
 
     if e.isLambda:
-        return Lambda(e.args, to_ssa(e.body))
+        return Lambda(e.args, to_ssa(e.body), e.id + "/ssa")
 
     if e.isLet:
         # let
@@ -1992,4 +2199,4 @@ def make_vjp(e, drets) -> tuple[List[Var], Expr]:
                 f"make_vjp: {len(fvs_remaining)} free vars in lambda not in args: {fvs_remaining}"
             )
 
-        return fvs_in, Lambda(e.args + drets, dbody)
+        return fvs_in, Lambda(e.args + drets, dbody, e.id + "/vjp")

@@ -152,7 +152,7 @@ def make_vjp_ssa(e: Expr, d_ins: list[Var] = None) -> Expr:
             d_ins = [make_vjp_ssa(v) for v in lam.args]
             body_vjp = make_vjp_ssa(lam.body, d_ins)
             new_args = lam.args + [d_out]
-            new_lam = Lambda(new_args, body_vjp)
+            new_lam = Lambda(new_args, body_vjp, lam.id + "/vjp_ssa")
 
             var = one(eqn.vars)
             return Eqn([d(var)], new_lam)
@@ -208,7 +208,7 @@ def inline_var_eq_var(e):
                 new_eqns += [Eqn(eqn.vars, new_val)]
             return Let(new_eqns, e.body)
 
-    return transform_postorder(transform, e, {})
+    return transform_postorder("v=v", transform, e, {})
 
 
 def global_getattrs_to_names(e):
@@ -220,7 +220,7 @@ def global_getattrs_to_names(e):
                 # It's a reference to a global variable, assume it's a module
                 return Var(f"{obj.name}.{attr.val}")
 
-    return transform_postorder(transform, e, {})
+    return transform_postorder("getattrs_to_names", transform, e, {})
 
 
 from jaxutils.vjp import softmax, relu, transpose

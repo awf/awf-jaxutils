@@ -20,26 +20,10 @@ from jax.extend.core import primitives as jaxprim
 from pprint import pprint
 
 import jaxutils
-from jaxutils.expr import (
-    Expr,
-    Var,
-    Const,
-    Lambda,
-    Eqn,
-    Let,
-    Call,
-    mkTuple,
-    isNone,
-    kwargs_to_dict_call,
-    new_call,
-)
+import jaxutils.expr as jex
+from jaxutils.expr import Expr, Var, Const, Lambda, Eqn, Let, Call, kwargs_to_dict_call
 
-from jaxutils.expr import (
-    dictassign,
-    optimize,
-    to_ast,
-    astunparse,
-)
+from jaxutils.expr import dictassign
 
 import ast
 
@@ -49,6 +33,13 @@ else:
     import astunparse
 
     unparse = astunparse.unparse
+
+
+def new_call(fn: str, *args, **kwargs):
+    """
+    Convenience function to make a Call node from a string, args, and kwargs
+    """
+    return Call(Var(fn), list(args) + kwargs_to_dict_call(kwargs))
 
 
 _prim_to_expr: Dict[jaxcore.Primitive, Callable[..., Optional[Expr]]] = {}
@@ -140,7 +131,7 @@ def _(x, permutation=None):
 
 @declare_prim_to_expr(lax.log_p)
 def _(x, accuracy=None):
-    if isNone(accuracy):
+    if jex.isNone(accuracy):
         return new_call("jnp.log", x)
     else:
         return new_call("jnp.log", x, accuracy=accuracy)
@@ -170,9 +161,12 @@ def _(
     out_sharding=None,
 ):
     if (
-        isNone(precision)
-        and (isNone(preferred_element_type) or preferred_element_type.val == np.float32)
-        and isNone(out_sharding)
+        jex.isNone(precision)
+        and (
+            jex.isNone(preferred_element_type)
+            or preferred_element_type.val == np.float32
+        )
+        and jex.isNone(out_sharding)
     ):
         # TODO Reverse-engineer to matmul where that's true, and if kwargs are default
         # mm_pattern = (((1,), (0,)), ((), ()))
@@ -283,7 +277,7 @@ def _(*args, **kwargs):
     # be aware of possible quadratic complexity in calling optimize
     update_jaxpr = kwargs.pop("update_jaxpr")
     if not update_jaxpr.isVar:
-        assert optimize(update_jaxpr) == Var("operator.__add__")
+        assert jex.optimize(update_jaxpr) == Var("operator.__add__")
 
     # Hope update_consts is Const(())
     assert not kwargs.pop("update_consts").val
@@ -317,15 +311,15 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
             val = _prim_to_expr[eqn.primitive](*eqn_args, **new_params)
 
         if val is None:
-            params = kwargs_to_dict_call(new_params)
+            params = jex.kwargs_to_dict_call(new_params)
             val = Call(Var(eqn.primitive.name + "_p.bind"), eqn_args + params)
 
         vars = map(jaxpr_to_expr_aux, eqn.outvars)
         new_eqns += [Eqn([*vars], val)]
 
-    body = Let(new_eqns, mkTuple([jaxpr_to_expr_aux(v) for v in jaxpr.outvars]))
+    body = Let(new_eqns, jex.mkTuple([jaxpr_to_expr_aux(v) for v in jaxpr.outvars]))
 
-    return Lambda(args, body)
+    return Lambda(args, body, "j2e_" + jex.get_new_name())
 
 
 varname_n = 0
@@ -418,7 +412,7 @@ def show_jaxpr(
     closed_jaxpr = jaxpr(*args)
 
     if reset_ids:
-        jaxutils.expr.reset_new_name_ids()
+        jex.reset_new_name_ids()
         global varname_n
         varname_n = 0
         global pjit_name_count
@@ -427,12 +421,12 @@ def show_jaxpr(
     e = jaxpr_to_expr(closed_jaxpr.jaxpr)
 
     if optimize:
-        e = jaxutils.expr.optimize(e)
+        e = jex.optimize(e)
 
-    as_ast = to_ast(e, name)
-    body_code = astunparse.unparse(as_ast)
+    as_ast = jex.to_ast(e, name)
+    body_code = unparse(as_ast)
 
-    fvs = list(v.name for v in jaxutils.expr.freevars(e))
+    fvs = list(v.name for v in jex.freevars(e))
     fvs_prims = list(v[:-5] for v in fvs if v.endswith(".bind"))
 
     if add_decls:

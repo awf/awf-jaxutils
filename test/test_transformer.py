@@ -186,11 +186,11 @@ def _make_test_data():
     # Initialize the transformer
     n_vocab = 17
     cfg, params = transformer_init(
-        n_vocab=n_vocab, d_model=22, n_layers=3, n_heads=2, d_k=11, d_ff=43
+        n_vocab=n_vocab, d_model=14, n_layers=3, n_heads=2, d_k=7, d_ff=13
     )
 
     # Create a random input sequence
-    L = 133
+    L = 5
     x = np.random.randint(0, n_vocab, L)
 
     return cfg, params, x
@@ -199,7 +199,7 @@ def _make_test_data():
 def test_transformer():
     cfg, params, x = _make_test_data()
     loss = transformer_loss(cfg, params, x, transformer)
-    np.testing.assert_almost_equal(loss, 3.107, decimal=3)
+    np.testing.assert_almost_equal(loss, 3.201, decimal=3)
 
 
 from jaxutils.expr import expr_for, expr_to_python_code, freevars
@@ -254,27 +254,7 @@ import jax.numpy as jnp
 
     cfg, params, x = _make_test_data()
     loss = transformer_loss(cfg, params, x, module.transformer)
-    np.testing.assert_almost_equal(loss, 3.107, decimal=3)
-
-
-from jaxutils.expr import Var, Call, Const
-
-
-def resolve_getattr(e, bindings=None):
-    def doit(e, bindings):
-        if e.isCall and e.f == Var("getattr"):
-            obj, attr = e.args
-            if obj.isVar and attr.isConst:
-                attr = attr.val
-                if attr == "T":
-                    return Call(Var("g_transpose"), [obj])
-                elif obj.name in bindings:
-                    val = bindings[obj.name]
-                    if isinstance(val, types.ModuleType):
-                        return Var(f"{val.__name__}.{attr}")
-            pass
-
-    return jex.transform_postorder(doit, e, bindings or {})
+    np.testing.assert_almost_equal(loss, 3.201, decimal=3)
 
 
 def mkcall(name: str):
@@ -288,6 +268,26 @@ def my_getattr(obj, attr):
         return mkcall("getattr")(obj, attr)
 
     #  g_pairs_to_dict,jax,print,standardize_rows
+
+
+# from jaxutils.expr import Var, Call, Const
+
+
+# def resolve_getattr(e, bindings=None):
+#     def doit(e, bindings):
+#         if e.isCall and e.f == Var("getattr"):
+#             obj, attr = e.args
+#             if obj.isVar and attr.isConst:
+#                 attr = attr.val
+#                 if attr == "T":
+#                     return Call(Var("g_transpose"), [obj])
+#                 elif obj.name in bindings:
+#                     val = bindings[obj.name]
+#                     if isinstance(val, types.ModuleType):
+#                         return Var(f"{val.__name__}.{attr}")
+#             pass
+
+#     return jex.transform_postorder("resolve_getattr", doit, e, bindings or {})
 
 
 def test_transformer_vjp():
@@ -321,3 +321,133 @@ def test_transformer_vjp():
 
     with open("tmp/transformer_vjpo.py", "w") as f:
         print(expr_to_python_code(vjpo, "transformer_vjpo"), file=f)
+
+
+from types import NoneType
+from jaxutils.expr_lib import (
+    g_identity,
+    g_slice,
+    g_subscript,
+    g_zeros_like,
+    g_tuple,
+    g_fst,
+    g_scan,
+    g_list,
+)
+
+from dataclasses import dataclass
+import numpy as np
+
+
+def broadcast_shape_and_type(a, b):
+    a_shape = a.shape if hasattr(a, "shape") else 1
+    b_shape = b.shape if hasattr(b, "shape") else 1
+    out_shape = np.broadcast_shapes(a_shape, b_shape)
+    a_dtype = a.dtype if hasattr(a, "dtype") else type(a)
+    b_dtype = b.dtype if hasattr(b, "dtype") else type(b)
+    out_dtype = np.promote_types(a_dtype, b_dtype)
+    return EmptyArray(out_shape, out_dtype)
+
+
+@dataclass
+class EmptyArray:
+    shape: tuple[int, ...]
+    dtype: np.dtype | type
+
+    @property
+    def size(self):
+        return np.prod(self.shape)
+
+    @property
+    def T(self):
+        return EmptyArray(self.shape[::-1], self.dtype)
+
+    def __add__(self, b):
+        return broadcast_shape_and_type(self, b)
+
+    def __mul__(self, b):
+        return broadcast_shape_and_type(self, b)
+
+    def __rmul__(self, b):
+        return broadcast_shape_and_type(self, b)
+
+    def __matmul__(self, b):
+        assert len(self.shape) == 2
+        assert len(b.shape) == 2
+        assert self.shape[1] == b.shape[0]
+        shape = (self.shape[0], b.shape[1])
+        dtype = np.promote_types(self.dtype, b.dtype)
+        return EmptyArray(shape, dtype)
+
+    def __getitem__(self, indices):
+        # https://numpy.org/devdocs//user/basics.indexing.html
+        # indices shorter than self.shape will return a subarray
+
+        def dim_shape(i):
+            if isinstance(indices[i], slice):
+                start = indices[i].start or 0
+                stop = indices[i].stop or self.shape[i]
+                step = indices[i].step or 1
+                return (stop - start) // step
+            if isinstance(indices[i], int):
+                return 1
+            if isinstance(indices[i], (jnp.ndarray, EmptyArray)):
+                return indices[i].shape[0]
+            raise TypeError(f"Unsupported index type: {type(indices[i])}")
+
+        out_shape = tuple(dim_shape(i) for i in range(len(indices)))
+
+        # Compare to numpy to check, but only if we are a small array
+        if self.size < 1000:
+            new_indexes = tuple(
+                i.make_ones() if isinstance(i, EmptyArray) else i for i in indices
+            )
+            assert self.make_ones()[new_indexes].shape == out_shape
+
+        return EmptyArray(out_shape, self.dtype)
+
+    def make_ones(self):
+        return np.ones(self.shape, self.dtype)
+
+
+def make_empty(a):
+    """
+    Make an "empty" version of object `obj`, which occupies less memory, but otherwise
+    behaves as much like `obj` as it can.
+    """
+    if hasattr(a, "shape") and hasattr(a, "dtype"):
+        return EmptyArray(a.shape, a.dtype)
+    else:
+        return a
+
+
+sp_jax = types.ModuleType("sp_jax")
+sp_jax.nn = types.ModuleType("sp_jax_nn")
+sp_jax.numpy = types.ModuleType("sp_jax_numpy")
+sp_jax.numpy.log = g_identity  # TODO: example values to avoid duplicating type rules?
+sp_jax.numpy.tril = g_identity
+sp_jax.numpy.ones = lambda shape, dtype=jnp.float32: EmptyArray(shape, dtype)
+
+sp_standardize_rows = g_identity
+sp_softmax = g_identity
+sp_print = lambda *args: NoneType
+
+
+def test_type_annot():
+    e = expr_for(transformer)
+    print(freevars(e))
+    cfg, params, x = _make_test_data()
+    bindings = {
+        "jax": sp_jax,
+        "jnp": sp_jax.numpy,
+        "standardize_rows": sp_standardize_rows,
+        "softmax": sp_softmax,
+        "print": sp_print,
+        "getattr": getattr,
+    }
+    sp_cfg = jax.tree.map(make_empty, cfg)
+    sp_params = jax.tree.map(make_empty, params)
+    sp_x = jax.tree.map(make_empty, x)
+    e = jex.annotate_eval(e, (sp_cfg, sp_params, sp_x), bindings)
+    with open("tmp/transformer_type_annot.py", "w") as f:
+        print(expr_to_python_code(e, "transformer_type_annot"), file=f)

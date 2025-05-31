@@ -15,7 +15,7 @@ def _make_e():
     foo, w, x, y, z = mkvars("foo, w, x, y, z")
     v_sin, v_add, v_mul = mkvars("sin, add, mul")
 
-    a_lam = Lambda([z], Call(v_sin, [Call(v_sin, [z])]))
+    a_lam = Lambda([z], Call(v_sin, [Call(v_sin, [z])]), "a")
     call_lam = Call(a_lam, [x])
     foo_lam = Lambda(
         [x, y],
@@ -27,6 +27,7 @@ def _make_e():
             ],
             Call(v_mul, [call_lam, Let([Eqn([y], Const(2.2))], y)]),
         ),
+        "foo",
     )
     e = Let(
         [

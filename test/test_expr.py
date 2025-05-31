@@ -44,7 +44,7 @@ def _make_e():
     foo, w, x, y, z = mkvars("foo, w, x, y, z")
     v_sin, v_add, v_mul = mkvars("sin, add, mul")
 
-    a_lam = Lambda([z], Call(v_sin, [z]))
+    a_lam = Lambda([z], Call(v_sin, [z]), "a")
     call_lam = Call(a_lam, [x])
     foo_lam = Lambda(
         [x, y],
@@ -55,6 +55,7 @@ def _make_e():
             ],
             Call(v_mul, [call_lam, Let([Eqn([y], v_sin)], y)]),
         ),
+        "foo",
     )
     e = Let(
         [
@@ -111,7 +112,7 @@ def test_eval():
 
 def test_let_to_lambda():
     e = _make_e()
-    l = transform_postorder(let_to_lambda, e, {})
+    l = transform_postorder("let_to_lambda", let_to_lambda, e, {})
 
     def check(e):
         assert not e.isLet

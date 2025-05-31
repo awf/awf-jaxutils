@@ -2,6 +2,10 @@
 import jax.numpy as jnp
 
 
+def g_identity(x):
+    return x
+
+
 def g_tuple(*a):
     return tuple(a)
 
