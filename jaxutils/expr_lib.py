@@ -1,5 +1,14 @@
-# Definitions of global functions used in expr_to_python_code
 import jax.numpy as jnp
+
+# Definitions of global functions used in expr_to_python_code
+
+g_vjp_table = {}
+
+
+def g_vjp(f):
+    if f in g_vjp_table:
+        return g_vjp_table[f]
+    raise KeyError(f"VJP for {f} not found in g_vjp_table. ")
 
 
 def g_identity(x):
@@ -27,6 +36,30 @@ def g_scan(f, init, xs, *args):
     for x in xs:
         carry = f(carry, x, *args)
     return carry
+
+
+def g_scan_vjp(f_and_vjp, init, xs, *args):
+    _, f, df = f_and_vjp
+
+    dret = args[-1]
+    args = args[:-1]
+    carries = [init]
+    # TODO: Quadratic if carry is appending lists of lists
+    # (but GPU memory not quadratic, the lists will point to reused values)
+    for x in xs:
+        carries += [f(carries[-1], x, *args)]
+
+    dcarry = dret
+    dxsx = []
+    dargs = [0] * len(args)
+    for i,x in enumerate(reversed(xs)):
+         = df(carries[-2], x, *args)
+        dcarry = dcarry + df_carry
+        carries.pop()
+    return df
+
+
+g_vjp_table[g_scan] = g_scan_vjp
 
 
 def g_list(*args):

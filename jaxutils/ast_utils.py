@@ -1,4 +1,36 @@
 import ast
+import enum
+import re
+from typing import Callable
+
+
+def better_repr(val):
+    if isinstance(val, enum.Enum):
+        # repr doesn't work for enum...
+        rep = str(val)
+    elif isinstance(val, (type, Callable)):
+        rep = val.__name__
+    else:
+        rep = repr(val)
+
+    rep = type(val).__module__ + "." + rep
+
+    def prettify_repr(s):
+        """
+        Perform various transformations to make the repr of a value more readable
+          builtins.() -> ()
+          numpy.dtypes.dtype('int32') -> np.int32
+        """
+        s = re.sub(r"^builtins\.", "", s)
+        s = re.sub(r"^numpy\.dtypes\.dtype\('(\w+)'\)", r"np.\1", s)
+        s = re.sub(r"^numpy\.(array.*), dtype=(\w+)", r"np.\1, dtype=np.\2", s)
+        s = re.sub(r"^numpy\.", r"np.", s)
+        s = re.sub(r"^jax._src.lax.slicing", "jax.lax", s)
+        s = re.sub(r"^jaxutils.array_expr", "jex", s)
+        return s
+
+    return prettify_repr(rep)
+
 
 # ChatGPT generated - looks ok....
 

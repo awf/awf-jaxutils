@@ -3,6 +3,7 @@ import numpy as np
 import jax.numpy as jnp
 import jax.nn as jnn
 from icecream import ic
+from numpy.random import randn
 
 
 def allclose(ref, test, rtol, atol, verbose=False):
@@ -29,7 +30,7 @@ def tree_allclose(tref, ttest, rtol, atol, verbose=True):
 
 
 def randlike(x):
-    return np.random.randn(*x.shape)
+    return randn(*x.shape)
 
 
 def ensure_tuple(val):
@@ -79,7 +80,7 @@ def add_vjp(x, y, dret):
 
 
 def test_add():
-    check(add, add_vjp, np.random.randn(13, 5), np.random.randn(13, 5))
+    check(add, add_vjp, randn(13, 5), randn(13, 5))
 
 
 # dup
@@ -94,7 +95,7 @@ def dup_vjp(x, *dret):
 
 
 def test_dup():
-    check(dup, dup_vjp, np.random.randn(13, 7))
+    check(dup, dup_vjp, randn(13, 7))
 
 
 # pair
@@ -109,7 +110,20 @@ def pair_vjp(x, y, *dret):
 
 
 def test_pair():
-    check(pair, pair_vjp, np.random.randn(13, 7), np.random.randn(13, 7))
+    check(pair, pair_vjp, randn(13, 7), randn(13, 7))
+
+
+# sum
+
+# No need to define sum - it's built in
+
+
+def sum_vjp(args, dret):
+    return list(dret for _ in args)
+
+
+def test_sum():
+    check(sum, sum_vjp, [randn(13, 5), randn(13, 5), randn(13, 5)])
 
 
 # scale scalar * Tensor
@@ -128,7 +142,7 @@ def scale_vjp(s, x, dret):
 
 
 def test_scale():
-    check(scale, scale_vjp, 3.3, np.random.randn(13, 7))
+    check(scale, scale_vjp, 3.3, randn(13, 7))
 
 
 # axpy
@@ -145,9 +159,7 @@ def axpy_vjp(A, x, y, dret):
 
 
 def test_axpy():
-    check(
-        axpy, axpy_vjp, np.random.randn(13, 7), np.random.randn(7), np.random.randn(13)
-    )
+    check(axpy, axpy_vjp, randn(13, 7), randn(7), randn(13))
 
 
 # mm
@@ -165,8 +177,8 @@ def mm_vjp(A, B, dret):
 
 
 def test_mm():
-    A = np.random.randn(13, 7).astype(np.float64)
-    B = np.random.randn(7, 3).astype(np.float64)
+    A = randn(13, 7).astype(np.float64)
+    B = randn(7, 3).astype(np.float64)
     with jax.default_matmul_precision("highest"):
         check(mm, mm_vjp, A, B)
 
@@ -186,8 +198,8 @@ def mul_vjp(A, B, dret):
 
 
 def test_mul():
-    A = np.random.randn(13, 7).astype(np.float64)
-    B = np.random.randn(13, 7).astype(np.float64)
+    A = randn(13, 7).astype(np.float64)
+    B = randn(13, 7).astype(np.float64)
     with jax.default_matmul_precision("highest"):
         check(mul, mul_vjp, A, B)
 
@@ -207,7 +219,10 @@ def dotall_vjp(A, B, dret):
 
 
 def test_dotall():
-    check(dotall, dotall_vjp, np.random.randn(13, 7), np.random.randn(13, 7))
+    check(dotall, dotall_vjp, randn(13, 7), randn(13, 7))
+
+
+# matmul scaled
 
 
 def mm_scaled(A, B, sA, sB):
@@ -241,8 +256,8 @@ def test_mm_scaled_simple():
     check(
         mm_scaled,
         mm_scaled_vjp_simple,
-        np.random.randn(7, 5),
-        np.random.randn(5, 3),
+        randn(7, 5),
+        randn(5, 3),
         1.23,
         2.34,
     )
@@ -265,8 +280,8 @@ def test_mm_scaled():
     check(
         mm_scaled,
         mm_scaled_vjp,
-        np.random.randn(7, 5),
-        np.random.randn(5, 3),
+        randn(7, 5),
+        randn(5, 3),
         1.23,
         2.34,
     )
@@ -298,7 +313,7 @@ def relu_vjp(x, dret):
 
 
 def test_relu():
-    check(relu, relu_vjp, np.random.randn(7))
+    check(relu, relu_vjp, randn(7))
 
 
 # softmax
@@ -318,7 +333,7 @@ def softmax_vjp(x, dret):
 
 
 def test_softmax():
-    check(softmax, softmax_vjp, np.random.randn(13, 3))
+    check(softmax, softmax_vjp, randn(13, 3))
 
 
 # index
@@ -366,7 +381,7 @@ def test_log():
     check(log, log_vjp, np.random.rand(13, 7))
 
 
-# log
+# exp
 exp = jnp.exp
 
 

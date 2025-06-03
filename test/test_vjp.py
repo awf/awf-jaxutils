@@ -2,13 +2,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from jaxutils.expr_eval import eval_expr
+from jaxutils.vjp import softmax, relu
 
-def ffn(W, x):
+
+def ffn_tupled(W, x):
     W1, b1, W2, b2 = W
     t1 = W1 @ x + b1
-    y1 = jax.nn.relu(t1)
+    y1 = relu(t1)
     y2 = W2 @ y1 + b2
-    return jax.nn.softmax(y2)
+    return softmax(y2)
 
 
 np.random.seed(1)
@@ -20,13 +23,11 @@ x = rand(7, B)
 
 
 def loss(W, x):
-    return -jnp.log(ffn(W, x)[5, 0])
+    return -jnp.log(ffn_tupled(W, x)[5, 0])
 
 
 import jaxutils.expr as jex
 from jaxutils.expr import (
-    expr_for,
-    expr_to_python_code,
     freevars,
     Expr,
     Let,
@@ -41,25 +42,69 @@ from jaxutils.expr import (
     transform_postorder,
     rename_let_v_in_v,
 )
+from jaxutils.expr_ast import expr_for, expr_to_python_code
+from jaxutils.expr_parser import parse_expr
 from more_itertools import one
+import math
 
 
-def test_to_ssa():
+def test_to_ssa_foo():
+    #
+    # let
+    #   a = let a = 1 in a
+    #   a = let a = 2 in a
+    #   b = a
+    # in
+    #   b
+
+    # ->
+    # let
+    #   a = let a_1 = 1 in a_1
+    #   a_2 = let a_3 = 2 in a_3
+    #   b = a_2
+    # in
+    #   b
+    example = """
+    let
+      a = let 
+            a = 1;
+            b = 3
+          in f(a, b);
+      a = let a = 2; b = lambda x, y: h(x, a, y) in b(a, 42)
+      ;
+      b = a
+    in
+      b
+    """
+
+    e = parse_expr(example)
+    print(to_ssa(e))
+
+
+def test_to_ssa_foo():
     def foo(x):
+        return math.sin(x)
+
+    def bar(x):
         y = x + (1 + foo(foo(x)))
         z = (lambda q: q * (q + foo(q)))(y + 2 + 4)
         return z
 
-    e = expr_for(foo)
-    print(expr_to_python_code(e, "foo"))
+    e = expr_for(bar, foo)
+    print(expr_to_python_code(e, "bar"))
     e = to_ssa(e)
-    print(expr_to_python_code(e, "foo"))
+    print(expr_to_python_code(e, "bar"))
     assert_is_ssa(e)
+    x = 3.1
+    bindings = {"math": math}
+    assert eval_expr(e, (x,), bindings) == bar(x)
 
-    e = expr_for(ffn)
-    print(expr_to_python_code(e, "foo"))
+
+def test_to_ssa_ffn():
+    e = expr_for(ffn_tupled)
+    print(expr_to_python_code(e, "ffn_tupled"))
     e = to_ssa(e)
-    print(expr_to_python_code(e, "foo"))
+    print(expr_to_python_code(e, "ffn_tupled"))
     assert_is_ssa(e)
 
     e = jex.detuple_lets(e)
@@ -73,6 +118,8 @@ def test_to_ssa():
     e = jex.dce(e)
     e = to_ssa(e)
     print(expr_to_python_code(e, "ssa"))
+    bindings = {"jax": jax, "softmax": softmax, "relu": relu}
+    np.testing.assert_allclose(eval_expr(e, (W, x), bindings), ffn_tupled(W, x))
 
 
 def make_vjp_ssa(e: Expr, d_ins: list[Var] = None) -> Expr:
@@ -195,6 +242,14 @@ def make_vjp_ssa(e: Expr, d_ins: list[Var] = None) -> Expr:
     assert False
 
 
+from jaxutils.array_expr import (
+    annotate_with_shadow_types,
+    strip_annotations,
+    ShadowArray,
+    global_getattrs_to_names,
+)
+
+
 def inline_var_eq_var(e):
     def transform(e, bindings):
         if e.isLet:
@@ -211,59 +266,116 @@ def inline_var_eq_var(e):
     return transform_postorder("v=v", transform, e, {})
 
 
-def global_getattrs_to_names(e):
-    def transform(e, bindings):
-        if e.isCall and e.f.isVar and e.f.name == "getattr":
-            obj = e.args[0]
-            attr = e.args[1]
-            if obj.isVar and obj.name not in bindings:
-                # It's a reference to a global variable, assume it's a module
-                return Var(f"{obj.name}.{attr.val}")
-
-    return transform_postorder("getattrs_to_names", transform, e, {})
-
-
 from jaxutils.vjp import softmax, relu, transpose
 
 
-def ffn_flat(W1, b1, W2, b2, x):
+def foo_ffn(W1, b1, W2, b2, x):
     t1 = W1 @ x + b1
     y1 = relu(t1)
-    y2 = transpose(W2) @ W2 @ (y1 * t1)  # + b2
-    return y2
-    # return softmax(y2)
+    y2 = W2 @ y1 + b2
+    return softmax(y2)
+
+
+def foo_funny(W1, b1, W2, b2, x):
+    t1 = W1 @ x + b1
+    y1 = relu(t1)
+    y2 = W2.T @ W2 @ (y1 * t1)  # + b2
+    return softmax(y2)
+
+
+def foo_list_append(W1, b1, W2, b2, x):
+    t1 = W1 @ x + b1
+    y1 = relu(t1)
+    y2 = W2.T @ W2 @ (y1 * t1)  # + b2
+    zs = []
+    for k in range(4):
+        zs += [pow(y2, k)]
+    sums = sum(zs)
+    return softmax(sums * 1.0e-6)
+
+
+def for_loop_accum(W1, b1, W2, b2, x):
+    t1 = W1 @ x + b1
+    y1 = relu(t1)
+    y2 = W2.T @ W2 @ (y1 * t1)  # + b2
+    zs = 0
+    for k in range(4):
+        zs += pow(y2, k)
+    return softmax(zs * 1.0e-6)
 
 
 from awfutils import import_from_file
-
 import pytest
+import operator
+from jaxutils.expr_lib import *
+from jaxutils.expr_eval import annotate_eval
+
+from enum import Enum
 
 
-@pytest.mark.parametrize("opt", ["opt", "raw"])
+def ExprArg(*args):
+    pass
+
+
+def ExprRet(*args):
+    pass
+
+
+def ExprCall(*args):
+    return ExprRet
+
+
+def annotate_expr_base(e: Expr) -> Expr:
+    """
+    Annotate the expression with extremely minimal "types".
+    All function calls return type "ExprRet", and all arguments are of type "ExprArg".
+    The main value is that it means that any expr whose value is a Lambda is identifiable,
+    using `e.annot.__name__ == "runLambda"`.
+    """
+    bindings = {v.name: ExprCall for v in freevars(e)}
+    bindings["g_scan"] = lambda f, init, xs, *args: f(init, xs, *args)
+    return annotate_eval(e, [ExprArg] * 5, bindings, add_operators=False)
+
+
+@pytest.mark.parametrize("opt", ["raw", "opt"])
 @pytest.mark.parametrize("ssa", ["ssa", "orig"])
-def test_vjp(opt, ssa):
+@pytest.mark.parametrize(
+    "funcname",
+    [
+        "foo_ffn",
+        "foo_funny",
+        "for_loop_accum",
+        "foo_list_append",
+    ],
+)
+def test_vjp(funcname, opt, ssa):
+    func = globals()[funcname]
     W1, b1, W2, b2 = W
-    print(ffn_flat(W1, b1, W2, b2, x))
+    ret = func(W1, b1, W2, b2, x)
+    print(ret)
 
-    e = expr_for(ffn_flat)
-    print(expr_to_python_code(e, "ffn_flat"))
+    e = expr_for(func)
 
-    e = global_getattrs_to_names(e)
-    e = inline_var_eq_var(e)
+    def check(e):
+        bindings = {x.name: eval(x.name) for x in freevars(e)}
+        val = eval_expr(e, (W1, b1, W2, b2, x), bindings, add_operators=False)
+        np.testing.assert_allclose(ret, val, atol=1e-4)
+
+    print(expr_to_python_code(e, funcname))
 
     if ssa == "ssa":
-        e_ssa = to_ssa_tidy(e)
-        e_ssa = rename_let_v_in_v(e_ssa, "ffn_flat")
-        e = e_ssa
+        e = to_ssa_tidy(e)
+        check(e)
 
-    print(expr_to_python_code(e, "ffn_flat"))
+    print(expr_to_python_code(e, funcname))
 
-    # fvs, vjp_raw = jex.make_vjp(e_ssa, [Var("dffn_flat_ssa")])
-    fvs, vjp_raw = jex.make_vjp(e, [Var("dffn_flat")])
-    # assert not fvs, f"Free vars in VJP: {fvs}"
+    e = annotate_expr_base(e)  # needed before vjp
+
+    dfuncname = "d" + e.body.name
+    fvs, vjp_raw = jex.make_vjp(e, [Var(dfuncname)])
 
     print("\n\n*** VJP (RAW) ***")
-    code = expr_to_python_code(vjp_raw, "d_ffn_flat")
+    code = expr_to_python_code(vjp_raw, dfuncname)
     print(code)
 
     if opt == "raw":
@@ -274,14 +386,19 @@ def test_vjp(opt, ssa):
     else:
         raise ValueError(f"Unknown optimization option: {opt}")
 
+    vjp = strip_annotations(vjp)
+
     print("\n\n*** VJP ***")
-    code = expr_to_python_code(vjp, "d_ffn_flat")
+    code = expr_to_python_code(vjp, dfuncname)
     print(code)
 
-    with open("tmp/ffn_flat_vjp.py", "w") as f:
+    filename = f"tmp/test_vjp_tmp_{funcname}_{ssa}_{opt}.py"
+    with open(filename, "w") as f:
         print(
             """
-from jaxutils.expr_lib import g_zeros_like
+import jax
+from jaxutils.expr_lib import *
+
 import operator as ssa_operator
 import operator
 from jaxutils.vjp import (
@@ -289,9 +406,10 @@ from jaxutils.vjp import (
     relu, relu_vjp,
     transpose, transpose_vjp,
     add_vjp, mm_vjp, mul_vjp,
+    sum_vjp,
 )
 
-vjp = {
+g_vjp_table |= {
     ssa_operator.__add__: add_vjp,
     ssa_operator.__matmul__: mm_vjp,
     ssa_operator.__mul__: mul_vjp,
@@ -301,22 +419,20 @@ vjp = {
     softmax: softmax_vjp,
     relu: relu_vjp,
     transpose: transpose_vjp,
+    sum: sum_vjp,
 }
-
-def g_vjp(f):
-    return vjp[f]
 """,
             file=f,
         )
         print(code, file=f)
 
-    mod = import_from_file("tmp/ffn_flat_vjp.py", "ffn_flat_vjp")
+    mod = import_from_file(filename, "test_vjp_tmp")
 
-    W1, b1, W2, b2 = W
-    d_out10 = rand(11, B)
-    g0 = jax.vjp(ffn_flat, W1, b1, W2, b2, x)[1](d_out10)
+    dret = rand(*ret.shape)
+    g0 = jax.vjp(func, W1, b1, W2, b2, x)[1](dret)
 
-    g = mod.d_ffn_flat(W1, b1, W2, b2, x, d_out10)
+    dfunc = getattr(mod, dfuncname)
+    g = dfunc(W1, b1, W2, b2, x, dret)
 
     for g, g0 in zip(g, g0):
         np.testing.assert_allclose(g, g0, atol=1e-4)
