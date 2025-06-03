@@ -162,9 +162,8 @@ def test_axpy():
     check(axpy, axpy_vjp, randn(13, 7), randn(7), randn(13))
 
 
-# mm
-
-
+# mm: (A, A) -> dA
+# mm_vjp: (A, A, dA) -> (dA, dA)
 def mm(A, B):
     return A @ B
 
@@ -183,9 +182,8 @@ def test_mm():
         check(mm, mm_vjp, A, B)
 
 
-# mul
-
-
+# mul: (A, A) -> A
+# mul_vjp: (A, A, dA) -> (dA, dA)
 def mul(A, B):
     return A * B
 
@@ -204,9 +202,8 @@ def test_mul():
         check(mul, mul_vjp, A, B)
 
 
-# dotall
-
-
+# dotall: (A, A) -> R
+# dotall_vjp: (A, A, dR) -> (dA, dA)
 def dotall(A, B):
     """dot(vec(A), vec(B))"""
     return (A * B).sum()
@@ -223,8 +220,8 @@ def test_dotall():
 
 
 # matmul scaled
-
-
+# mm_scaled: (A, A, R, R) -> A
+# mm_scaled_vjp: (A, A, R, R, dA) -> (dA, dA, dR, dR)
 def mm_scaled(A, B, sA, sB):
     """
     Take matrices A and B, with associated scale factors sA, sB,
@@ -287,7 +284,8 @@ def test_mm_scaled():
     )
 
 
-# recip
+# recip: A -> A
+# recip_vjp : (A, dA) -> dA
 def recip(x):
     r = 1 / x
     return r
@@ -301,9 +299,8 @@ def test_recip():
     check(recip, recip_vjp, 0.001 + np.random.rand(13, 7))
 
 
-# relu
-
-
+# relu: A -> A
+# relu_vjp : (A, dA) -> dA
 def relu(x):
     return jnn.relu(x)
 
@@ -316,9 +313,8 @@ def test_relu():
     check(relu, relu_vjp, randn(7))
 
 
-# softmax
-
-
+# softmax: A -> A
+# softmax_vjp : (A, dA) -> dA
 def softmax(x):
     """
     Column softmax
@@ -336,9 +332,8 @@ def test_softmax():
     check(softmax, softmax_vjp, randn(13, 3))
 
 
-# index
-
-
+# index: A, i -> R
+# index_vjp : (A, i, dR) -> dA
 def index(x, i):
     return x[i]
 
@@ -356,7 +351,8 @@ def test_index():
     )
 
 
-# transpose
+# transpose: A -> A'
+# transpose_vjp : (A, dA') -> dA
 def transpose(x):
     return jnp.transpose(x)
 
@@ -369,7 +365,8 @@ def test_transpose():
     check(transpose, transpose_vjp, np.random.rand(13, 7))
 
 
-# log
+# log: A -> A
+# log_vjp : (A, dA) -> dA
 log = jnp.log
 
 
@@ -381,7 +378,8 @@ def test_log():
     check(log, log_vjp, np.random.rand(13, 7))
 
 
-# exp
+# exp: A -> A
+# exp_vjp : (A, dA) -> dA
 exp = jnp.exp
 
 
@@ -393,7 +391,17 @@ def test_exp():
     check(exp, exp_vjp, np.random.rand(13, 7))
 
 
-# negate
+# pow: (A, Z) -> A
+# pow_vjp : (A, Z, dA) -> (dA, None)
+def pow_vjp(x, p, dret):
+    assert np.issubdtype(type(p), np.integer)
+    dx = dret * p * x ** (p - 1)
+
+    return dx, None
+
+
+# negate: A -> A
+# negate_vjp : (A, dA) -> dA
 def negate(x):
     return -x
 
@@ -404,3 +412,9 @@ def negate_vjp(x, dret):
 
 def test_negate():
     check(negate, negate_vjp, np.random.rand(13, 7))
+
+
+# range: (Z,Z,Z) -> seq(Z)
+# range_vjp : (Z,Z,Z,dseq) -> (dZ,dZ,dZ)
+def range_vjp(*args):
+    return (None,) * (len(args) - 1)

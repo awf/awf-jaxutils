@@ -214,8 +214,9 @@ def global_getattrs_to_names(e):
             if obj.isVar and obj.name not in bindings:
                 # It's a reference to a global variable, assume it's a module
                 return Var(f"{obj.name}.{attr.val}")
-            if isinstance(obj.annot, (jnp.ndarray, ShadowArray)):
-                if attr.val == "T":
-                    return Call(Var("transpose"), [obj])
+            if attr.val == "T":
+                if not isinstance(obj.annot, (jnp.ndarray, ShadowArray)):
+                    print(f"Warning: Assuming {obj.name}.T is a transpose")
+                return Call(Var("transpose"), [obj])
 
     return transform_postorder("ga2n", transform, e, {})

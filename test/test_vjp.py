@@ -354,7 +354,8 @@ def test_vjp(funcname, opt, ssa):
     ret = func(W1, b1, W2, b2, x)
     print(ret)
 
-    e = expr_for(func)
+    global_names = {"pow"}
+    e = expr_for(func, global_names=global_names)
 
     def check(e):
         bindings = {x.name: eval(x.name) for x in freevars(e)}
@@ -370,6 +371,7 @@ def test_vjp(funcname, opt, ssa):
     print(expr_to_python_code(e, funcname))
 
     e = annotate_expr_base(e)  # needed before vjp
+    e = global_getattrs_to_names(e)
 
     dfuncname = "d" + e.body.name
     fvs, vjp_raw = jex.make_vjp(e, [Var(dfuncname)])
@@ -406,7 +408,7 @@ from jaxutils.vjp import (
     relu, relu_vjp,
     transpose, transpose_vjp,
     add_vjp, mm_vjp, mul_vjp,
-    sum_vjp,
+    sum_vjp, pow_vjp, range_vjp
 )
 
 g_vjp_table |= {
@@ -420,6 +422,8 @@ g_vjp_table |= {
     relu: relu_vjp,
     transpose: transpose_vjp,
     sum: sum_vjp,
+    pow: pow_vjp,
+    range: range_vjp,
 }
 """,
             file=f,

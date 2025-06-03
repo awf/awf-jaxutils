@@ -35,7 +35,7 @@ def better_repr(val):
 # ChatGPT generated - looks ok....
 
 import ast
-from typing import Set, List
+from typing import Set, List, Optional
 
 
 class FreeVarAnalyzer(ast.NodeVisitor):
@@ -43,9 +43,12 @@ class FreeVarAnalyzer(ast.NodeVisitor):
     AST visitor that collects names used but not bound (free variables).
     """
 
-    def __init__(self):
+    def __init__(self, global_names: Optional[Set[str]] = None):
         # Stack of bound variable sets for each scope
         self.bound_stack: List[Set[str]] = [set()]
+        # If provided, global names are considered bound in the outermost scope
+        if global_names is not None:
+            self.bound_stack = [global_names] + self.bound_stack
         # Collected free variable names
         self.free: Set[str] = set()
 

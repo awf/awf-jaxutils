@@ -4,7 +4,8 @@ import operator
 from itertools import chain
 from more_itertools import one
 from beartype import beartype
-from beartype.typing import List, List, Callable, Optional
+from beartype.typing import List, List, Callable, Optional, Set
+
 from jaxutils.expr import (
     Expr,
     Var,
@@ -341,10 +342,14 @@ def _ast_error(msg, path):
 
 
 @beartype
-def ast_to_expr(a: Optional[ast.AST], path_to_a: List[Optional[ast.AST]]):
-    recurse = lambda sub_expr: ast_to_expr(sub_expr, path_to_a + [a])
+def ast_to_expr(
+    a: Optional[ast.AST],
+    path_to_a: List[Optional[ast.AST]],
+    global_names: Optional[Set[str]] = None,
+) -> Expr | List[Expr]:
+    recurse = lambda sub_expr: ast_to_expr(sub_expr, path_to_a + [a], global_names)
     err = lambda msg: _ast_error(msg, path_to_a)
-    ast_to_eqn = lambda stmt: _ast_to_eqn(stmt, path_to_a + [a])
+    ast_to_eqn = lambda stmt: _ast_to_eqn(stmt, path_to_a + [a], global_names)
 
     if isinstance(a, ast.Module):
         return recurse(one(a.body))
@@ -421,10 +426,10 @@ def ast_to_expr(a: Optional[ast.AST], path_to_a: List[Optional[ast.AST]]):
     assert False, f"TODO:{type(a)}"
 
 
-def _ast_to_eqn(stmt, path_to_a):
-    recurse = lambda sub_expr: ast_to_expr(sub_expr, path_to_a + [stmt])
+def _ast_to_eqn(stmt, path_to_a, global_names):
+    recurse = lambda sub_expr: ast_to_expr(sub_expr, path_to_a + [stmt], global_names)
     err = lambda msg: _ast_error(msg, path_to_a)
-    ast_to_eqn = lambda stmt: _ast_to_eqn(stmt, path_to_a + [stmt])
+    ast_to_eqn = lambda stmt: _ast_to_eqn(stmt, path_to_a + [stmt], global_names)
 
     if isinstance(stmt, ast.FunctionDef):
         args = recurse(stmt.args)
@@ -468,12 +473,11 @@ def _ast_to_eqn(stmt, path_to_a):
         iter = recurse(stmt.iter)
         body_eqns = [ast_to_eqn(stmt) for stmt in stmt.body]
 
-        analyzer = FreeVarAnalyzer()
+        analyzer = FreeVarAnalyzer(global_names)
         for body_stmt in stmt.body:
             analyzer.visit(body_stmt)
-            # print(ast.unparse(body_stmt))
-        # print(one(analyzer.bound_stack), "<-", analyzer.free)
-        iteration_var_names = one(analyzer.bound_stack) & analyzer.free
+
+        iteration_var_names = analyzer.bound_stack[1] & analyzer.free
         iteration_vars = [Var(name) for name in iteration_var_names]
 
         lambda_args = iteration_vars + [target]
@@ -514,7 +518,11 @@ def ex2py(name, ex):
         print(ast.unparse(to_ast(ex, "ret")), file=f)
 
 
-def expr_for(func: Callable, *callees: Callable) -> Expr:
+def expr_for(
+    func: Callable,
+    *callees: Callable,
+    global_names: Optional[Set[str]] = None,
+) -> Expr:
     """
     Create an expression that represents Callables `func` and `callees`.
 
@@ -535,7 +543,7 @@ def expr_for(func: Callable, *callees: Callable) -> Expr:
     eqns = []
     for f in reversed((func,) + callees):
         a = ast.parse(textwrap.dedent(inspect.getsource(f)))
-        e = ast_to_expr(a, [])
+        e = ast_to_expr(a, [], global_names)
         assert e.isLet and len(e.eqns) == 1 and one(e.eqns[0].vars) == e.body
         if f == func:
             func_var = e.body

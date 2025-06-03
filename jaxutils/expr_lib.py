@@ -49,14 +49,19 @@ def g_scan_vjp(f_and_vjp, init, xs, *args):
     for x in xs:
         carries += [f(carries[-1], x, *args)]
 
+    # assuming ratio of list length to compute is small, so using indexing for readability
+    n = len(xs)
     dcarry = dret
-    dxsx = []
+    dxs = [0] * n
     dargs = [0] * len(args)
-    for i,x in enumerate(reversed(xs)):
-         = df(carries[-2], x, *args)
-        dcarry = dcarry + df_carry
-        carries.pop()
-    return df
+    for i in reversed(range(n)):
+        dci, dxi, dargsi = df(carries[i], xs[i], *args, dcarry)
+        dxs[i] = dxi
+        for k in range(len(args)):
+            dargs[k] += dargsi
+        dcarry = dci
+
+    return None, dcarry, dxs, *dargs
 
 
 g_vjp_table[g_scan] = g_scan_vjp
