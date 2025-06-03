@@ -40,10 +40,10 @@ from jaxutils.expr import (
     to_ssa_tidy,
     assert_is_ssa,
     transform_postorder,
-    rename_let_v_in_v,
 )
 from jaxutils.expr_ast import expr_for, expr_to_python_code
 from jaxutils.expr_parser import parse_expr
+from jaxutils.expr_eval import _bindings_for_expr_lib
 from more_itertools import one
 import math
 
@@ -269,32 +269,21 @@ def inline_var_eq_var(e):
 from jaxutils.vjp import softmax, relu, transpose
 
 
-def foo_ffn(W1, b1, W2, b2, x):
+def foo1_ffn(W1, b1, W2, b2, x):
     t1 = W1 @ x + b1
     y1 = relu(t1)
     y2 = W2 @ y1 + b2
     return softmax(y2)
 
 
-def foo_funny(W1, b1, W2, b2, x):
+def foo2_funny(W1, b1, W2, b2, x):
     t1 = W1 @ x + b1
     y1 = relu(t1)
     y2 = W2.T @ W2 @ (y1 * t1)  # + b2
-    return softmax(y2)
+    return softmax(y2 * 0.01)
 
 
-def foo_list_append(W1, b1, W2, b2, x):
-    t1 = W1 @ x + b1
-    y1 = relu(t1)
-    y2 = W2.T @ W2 @ (y1 * t1)  # + b2
-    zs = []
-    for k in range(4):
-        zs += [pow(y2, k)]
-    sums = sum(zs)
-    return softmax(sums * 1.0e-6)
-
-
-def for_loop_accum(W1, b1, W2, b2, x):
+def foo3_forloop_accum(W1, b1, W2, b2, x):
     t1 = W1 @ x + b1
     y1 = relu(t1)
     y2 = W2.T @ W2 @ (y1 * t1)  # + b2
@@ -302,6 +291,39 @@ def for_loop_accum(W1, b1, W2, b2, x):
     for k in range(4):
         zs += pow(y2, k)
     return softmax(zs * 1.0e-6)
+
+
+def foo4_forloop_list_append(W1, b1, W2, b2, x):
+    t1 = W1 @ x + b1
+    y1 = relu(t1)
+    y2 = W2.T @ W2 @ (y1 * t1)  # + b2
+    zs = []
+    for k in range(4):
+        zs = g_list_append(zs, pow(y2, k) * 10**-k)
+    sums = sum(zs)
+    return softmax(sums * 1.0e-6)
+
+
+def foo4_forloop_list_append2(W1, b1, W2, b2, x):
+    t1 = W1 @ x + b1
+    y1 = relu(t1)
+    y2 = W2.T @ W2 @ (y1 * t1)  # + b2
+    zs = []
+    for k in range(4):
+        zs += [pow(y2, k) * 10**-k]  # TODO: overloaded add on list, others
+    sums = sum(zs)
+    return softmax(sums * 1.0e-6)
+
+
+def foo4_forloop_list_append3(W1, b1, W2, b2, x):
+    t1 = W1 @ x + b1
+    y1 = relu(t1)
+    y2 = W2.T @ W2 @ (y1 * t1)  # + b2
+    zs = []
+    for k in range(4):
+        zs.append(pow(y2, k) * 10**-k)  # TODO: getattr call mutates zs, harden getattrs
+    sums = sum(zs)
+    return softmax(sums * 1.0e-6)
 
 
 from awfutils import import_from_file
@@ -342,10 +364,10 @@ def annotate_expr_base(e: Expr) -> Expr:
 @pytest.mark.parametrize(
     "funcname",
     [
-        "foo_ffn",
-        "foo_funny",
-        "for_loop_accum",
-        "foo_list_append",
+        "foo1_ffn",
+        "foo2_funny",
+        "foo3_forloop_accum",
+        "foo4_forloop_list_append",
     ],
 )
 def test_vjp(funcname, opt, ssa):
@@ -355,12 +377,16 @@ def test_vjp(funcname, opt, ssa):
     print(ret)
 
     global_names = {"pow"}
+    global_names |= _bindings_for_expr_lib().keys()
+
     e = expr_for(func, global_names=global_names)
 
     def check(e):
         bindings = {x.name: eval(x.name) for x in freevars(e)}
         val = eval_expr(e, (W1, b1, W2, b2, x), bindings, add_operators=False)
         np.testing.assert_allclose(ret, val, atol=1e-4)
+
+    e = jex.uniquify_names(e)  # TODO: remove
 
     print(expr_to_python_code(e, funcname))
 
@@ -408,7 +434,7 @@ from jaxutils.vjp import (
     relu, relu_vjp,
     transpose, transpose_vjp,
     add_vjp, mm_vjp, mul_vjp,
-    sum_vjp, pow_vjp, range_vjp
+    sum_vjp, pow_vjp, range_vjp, negate_vjp
 )
 
 g_vjp_table |= {
@@ -418,12 +444,16 @@ g_vjp_table |= {
     operator.__add__: add_vjp,
     operator.__matmul__: mm_vjp,
     operator.__mul__: mul_vjp,
+    operator.__pow__: pow_vjp,
+    operator.__neg__:  negate_vjp,
     softmax: softmax_vjp,
     relu: relu_vjp,
     transpose: transpose_vjp,
     sum: sum_vjp,
     pow: pow_vjp,
     range: range_vjp,
+    g_list: g_list_vjp,
+    g_list_append: g_list_append_vjp,
 }
 """,
             file=f,

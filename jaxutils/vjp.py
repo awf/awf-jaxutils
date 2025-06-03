@@ -396,8 +396,13 @@ def test_exp():
 def pow_vjp(x, p, dret):
     assert np.issubdtype(type(p), np.integer)
     dx = dret * p * x ** (p - 1)
+    dp = dret * log(x) * x**p
 
-    return dx, None
+    return dx, dp
+
+
+def test_negate():
+    check(negate, negate_vjp, np.random.rand(13, 7))
 
 
 # negate: A -> A

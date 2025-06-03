@@ -40,6 +40,8 @@ def test_uniquify():
     #   b = a_2
     # in
     #   b
+    jex.reset_new_name_ids()
+
     example = """
     let
       a = let 
@@ -60,18 +62,18 @@ def test_uniquify():
     example_out = """
     let
       a = let 
-            a_1 = 1;
-            b = 3
+            a_2 = 1;
+            b_1 = 3
           in
-            f(a_1, b);
-      a_2 = let
+            f(a_2, b_1);
+      a_1 = let
             a_3 = 2;
-            b_1 = lambda x, b_2: h(x, a_3, b_2) 
+            b_2 = lambda x, b_3: h(x, a_3, b_3) 
           in
-            b_1(a_3, 42);
-      b_3 = a_2
+            b_2(a_3, 42);
+      b = a_1
     in
-      tuple(a_2, b_3)
+      tuple(a_1, b)
     """
 
     e = parse_expr(example)
@@ -110,6 +112,8 @@ def test_to_ssa():
     #   b = a_2
     # in
     #   b
+    jex.reset_new_name_ids()
+
     example = """
     let
       a = let 
@@ -129,16 +133,16 @@ def test_to_ssa():
 
     expected = """
     let
-      a_1 = 1;
-      b = 3;
-      a = f(a_1, b);
+      a_2 = 1;
+      b_1 = 3;
+      a = f(a_2, b_1);
       a_3 = 2;
-      b_1 = lambda x, y: let _ssa_03 = h(x, a_3, y) in _ssa_03;
-      a_2 = b_1(a_3, 42);
-      b_2 = a_2;
-      _ssa_05 = tuple(a_2, b_2)
+      b_2 = lambda x, y: let _ssa_03 = h(x, a_3, y) in _ssa_03;
+      a_1 = b_2(a_3, 42);
+      b = a_1;
+      _ssa_06 = tuple(a_1, b)
     in
-      _ssa_05
+      _ssa_06
     """
 
     e_in = parse_expr(example)

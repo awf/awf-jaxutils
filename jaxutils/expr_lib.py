@@ -71,6 +71,24 @@ def g_list(*args):
     return list(args)
 
 
+def g_list_vjp(*args_and_dret):
+    dret = args_and_dret[-1]
+    args = args_and_dret[:-1]
+    assert isinstance(dret, list)
+    assert len(dret) == len(args)
+    return tuple(x for x in dret) if len(dret) > 0 else dret
+
+
+def g_list_append(xs, y):
+    return xs + [y]
+
+
+def g_list_append_vjp(xs, y, dxs_and_dy):
+    assert isinstance(dxs_and_dy, list)
+    assert len(dxs_and_dy) == len(xs) + 1
+    return dxs_and_dy[:-1], dxs_and_dy[-1]
+
+
 def g_zeros_like(x):
     return jnp.zeros_like(x)
 

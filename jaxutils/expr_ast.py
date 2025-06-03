@@ -473,12 +473,19 @@ def _ast_to_eqn(stmt, path_to_a, global_names):
         iter = recurse(stmt.iter)
         body_eqns = [ast_to_eqn(stmt) for stmt in stmt.body]
 
+        # TODO: this whole thing should be a visitor
         analyzer = FreeVarAnalyzer(global_names)
         for body_stmt in stmt.body:
             analyzer.visit(body_stmt)
 
-        iteration_var_names = analyzer.bound_stack[1] & analyzer.free
+        iteration_var_names = analyzer.bound_stack[-1] & analyzer.free
         iteration_vars = [Var(name) for name in iteration_var_names]
+
+        if not iteration_vars:
+            # We missed a write or side-effect
+            raise ValueError(
+                "For loop has no iteration variables.  Missed side-effect?"
+            )
 
         lambda_args = iteration_vars + [target]
         extra_args = [

@@ -938,6 +938,7 @@ def eliminate_identities(e: Expr, bindings: Dict[str, Any]) -> Expr:
 import re
 
 
+@beartype
 def make_new_name(name_container: Dict[str, Any] | Set[str], name: str) -> str:
     if m := re.match(r"(.*)_(\d+)$", name):
         basename = m[1]
@@ -950,6 +951,14 @@ def make_new_name(name_container: Dict[str, Any] | Set[str], name: str) -> str:
         newname = basename + f"_{i}"
         i += 1
     return newname
+
+
+@beartype
+def make_new_var(var_container: Set[Var], v: Var) -> Var:
+    # TODO, slow... instead duplicate logic above, but let's wait until solidified
+    name_container = {v.name for v in var_container}
+    newname = make_new_name(name_container, v.name)
+    return Var(newname, annot=v.annot)
 
 
 def uniquify_names(e: Expr) -> Expr:
@@ -997,6 +1006,13 @@ def uniquify_names(e: Expr) -> Expr:
             return Lambda(new_vars, new_body, e.id + "/unq", annot=e.annot)
 
         if e.isLet:
+            # Commandeer new names for everyone in this let
+            local_newnames = {
+                (id(eqn), id(var)): make_new(var.name)
+                for eqn in e.eqns
+                for var in eqn.vars
+            }
+
             new_translations = {**translations}
             new_eqns = []
             for eqn in e.eqns:
@@ -1004,10 +1020,7 @@ def uniquify_names(e: Expr) -> Expr:
 
                 new_vars = []
                 for var in eqn.vars:
-                    # This var has just come in scope.
-                    # If its name is already in translations, it is clashing,
-                    # so in the body of this let, it will need a new name
-                    newname = make_new(var.name)
+                    newname = local_newnames[(id(eqn), id(var))]
                     new_translations[var.name] = newname
                     new_vars += [Var(newname, annot=var.annot)]
 
@@ -1356,6 +1369,10 @@ def concatlists(lists: Sequence[List[Any]]) -> List[Any]:
     return [item for sublist in lists for item in sublist]
 
 
+def d(v):
+    return Var(f"d{v.name}")
+
+
 def make_vjp(e, drets) -> tuple[List[Var], Expr]:
     # vjp(e, drets) returns a pair of (d(freevars), expr)
     def oplus_(d, d2):
@@ -1364,9 +1381,6 @@ def make_vjp(e, drets) -> tuple[List[Var], Expr]:
                 d[k] = _add(d[k], v)
             else:
                 d[k] = v
-
-    def d(v):
-        return Var(f"d{v.name}")
 
     def vjp_name(e):
         # assert e.isVar, f"vjp_name: e must be a Var, not {e}"
@@ -1387,17 +1401,13 @@ def make_vjp(e, drets) -> tuple[List[Var], Expr]:
         #              _d1, ..., _dn = vjp[f](arg1, ..., argn, drets)
         #              dfv1_1, dfv4_1, dfvk_1 = D[arg1, _d1] # This eqn contribs to fv1, fv4, fvk
         #              ...
-        #              dfv2_2, dfv4_2, dfv7_2 = D[argn, _dn]
+        #              dfv4_2, dfv7_2 = D[argn, _dn]         # This eqn contribs to fv4, fv7
         #            in
         #              g_tuple(dfv1_1, ..., dfv4_1 + dfv4_2, ... dfv_k_n)
-
-        f_vjp = vjp_name(e.f)
-        dis = [Var(f"_d{i}_" + get_new_name()) for i, arg in enumerate(e.args)]
 
         # Replace any lambdas l in args with a pair (l, vjp_l)
         new_args = []
         for arg in e.args:
-            assert arg.isVar or arg.isConst
             if (
                 arg.isVar
                 and isinstance(arg.annot, Callable)
@@ -1409,7 +1419,13 @@ def make_vjp(e, drets) -> tuple[List[Var], Expr]:
                 # Otherwise, just use the arg
                 new_args += [arg]
 
+        f_vjp = vjp_name(e.f)
+
+        # Need to make temporaries for all args
+        dis = [Var(f"_d{i}_" + get_new_name()) for i, arg in enumerate(e.args)]
         eqns = [Eqn(dis, Call(f_vjp, new_args + drets))]
+
+        # Now add in contributions to freevars
         fv_contribs = {}
         for i, (arg, di) in enumerate(zip(e.args, dis)):
             fvs, expr = make_vjp(arg, [di])
@@ -1445,12 +1461,6 @@ def make_vjp(e, drets) -> tuple[List[Var], Expr]:
         #             dfvs_e1 = D[e1, dvs1]   # mapping from freevars of e1 to diffs
         #           in
         #             osum(dfvs_body, dfvs_e2, dfvs_e1)
-        fvs_body, dbody = make_vjp(e.body, drets)
-        if not dbody:
-            # Whole let is constant, return
-            return [], None
-
-        fvs_body_0 = [Var(v.name + "_body") for v in fvs_body]
 
         # Check there's no name shadowing in this let - code should
         # work, but hasn't been tested
@@ -1460,69 +1470,123 @@ def make_vjp(e, drets) -> tuple[List[Var], Expr]:
         eqns = []
         # Emit vjps for forward pass, and lambdas
         for eqn in e.eqns:
+            # emit the eqn
             eqns += [Eqn(eqn.vars, eqn.val)]
+
+            # and, for a lambda, emit the vjp
             if eqn.val.isLambda:
-                douts = [d(one(eqn.vars))]
-                fvs, dval = make_vjp(eqn.val, douts)
-                eqns += [Eqn(fvs, dval)]
-            else:
-                # hope it's not a nested expression that evals to a lambda
-                assert not (
-                    isinstance(eqn.val.annot, Callable)
-                    and eqn.val.annot.__name__ == "runLambda"
-                )
+                dlamname = d(one(eqn.vars))
+                fvs, dlam = make_vjp_for_lambda(eqn.val)
+                eqns += [Eqn([dlamname], dlam)]
+
+        dfvs_body, dbody = make_vjp(e.body, drets)
 
         # Emit vjps for the body
-        eqns += [Eqn(fvs_body_0, dbody)]
+        eqns += [Eqn(dfvs_body, dbody)]
 
-        fv_contribs = {fv: fv_body_0 for fv, fv_body_0 in zip(fvs_body, fvs_body_0)}
+        dfvs_in_scope = set(dfvs_body)
 
         for i, eqn in enumerate(reversed(e.eqns)):
-            if not eqn.val.isLambda:
-                # Make douts, and remove from contribs if present - they can't be needed
-                # again, as they just came into scope in the primal, so are going out of
-                # scope in the adjoint.
-                douts = []
-                for out in eqn.vars:
-                    dout = d(out)
-                    if dout in fv_contribs:
-                        douts += [fv_contribs[dout]]
-                        del fv_contribs[dout]
-                    else:
-                        douts += [dout]
+            if eqn.val.isLambda:
+                continue
 
-                # Make the vjp for the rhs
-                fvs, dval = make_vjp(eqn.val, douts)
-                if not dval:
-                    assert not fvs
-                    continue
+            douts = [d(out) for out in eqn.vars]
 
-                # Rename the fvs so we can access them in the contribs
-                fvs_i = [Var(v.name + "_" + str(i)) for v in fvs]
-                eqns += [Eqn(fvs_i, dval)]
-                oplus_(fv_contribs, {fv: fv_i for fv, fv_i in zip(fvs, fvs_i)})
+            # Make the vjp for the rhs
+            dfvs_val, dval = make_vjp(eqn.val, douts)
 
-        fvs = list(fv_contribs.keys())
-        rets = mkTuple(list(fv_contribs.values()))
-        ret = Let(eqns, rets)
+            if not dfvs_val:
+                continue
 
-        return fvs, ret
+            # For values that are in scope, we'll need to add the contributions,
+            # so use a dummy in the lhs.
+            # i.e., we had
+            #   foo(a,b,c,d)
+            #      r = a+b
+            #      s = r+d
+            #      t = a+s
+            #      return sin(t)
+            # and so far, we have
+            #   dfoo(a,b,c,d, dret)
+            #      r = a+b
+            #      s = r+d
+            #      t = a+s
+            #      dt = cos(t) * dret
+            #      da, ds = +'(a,s,dt)
+            #      dr, dd = +'(r,d,ds)
+            #      # da, db = +'(a,b,dr) # oops about to overwrite da
+            #      da_1, db = +'(a,b,dr) # so put it in a temp
+            #      da = da + da_1  # and add it
+            #      return (da, db, dc, dd)
+
+            # Rename the fvs so we can access them in the contribs
+            dv_contribs = [make_new_var(dfvs_in_scope, dv) for dv in dfvs_val]
+            eqns += [Eqn(dv_contribs, dval)]
+
+            # And add any that got renamed
+            for dv, dv_contrib in zip(dfvs_val, dv_contribs):
+                if dv != dv_contrib:
+                    eqns += [Eqn([dv], _add(dv, dv_contrib))]
+
+            # Now these are all in scope
+            dfvs_in_scope |= set(dfvs_val)
+
+            # And my douts are going out of scope - this was the eqn than introduced them
+            dfvs_in_scope -= set(douts)
+
+        dfvs = list(dfvs_in_scope)
+
+        # dfvs = [
+        #     d(v) for v in freevars(e) if v in dfvs_in_scope
+        # ]  # TODO: derive from above pass
+
+        ret = Let(eqns, mkTuple(dfvs))
+
+        return dfvs, ret
 
     if e.isLambda:
-        # D[lambda args: body, _drets] =
-        #   [fvs(body)-args], lambda args, dret: D[body, dret]
-        fvs_in = drets
-        drets = [Var(f"dret{get_new_name()}")]
-        fvs_body, dbody = make_vjp(e.body, drets)
-        dargs_assigned = [
-            d(arg) if d(arg) in fvs_body else _zeros_like(arg) for arg in e.args
-        ]
-        dbody = Let([Eqn(fvs_body, dbody)], mkTuple(dargs_assigned))
-        dargs = set(d(arg) for arg in e.args)
-        fvs_remaining = [fv for fv in fvs_body if fv not in dargs]
-        if fvs_remaining:
-            print(
-                f"make_vjp: {len(fvs_remaining)} free vars in lambda not in args: {fvs_remaining}"
-            )
+        assert False, "all lambdas should be let-bound"
 
-        return fvs_in, Lambda(e.args + drets, dbody, e.id + "/vjp")
+
+def is_global(v: Expr) -> bool:
+    if isinstance(v.annot, Callable) and v.annot.__name__ in ("ExprCall",):
+        # If the annot is an ExprCall, then this is a global variable
+        return True
+
+    return False
+
+
+def make_vjp_for_lambda(e: Lambda) -> tuple[List[Var], Lambda]:
+    # D[lambda args: body, _drets] =
+    #   [dfvs],
+    #   lambda args, dret: let dfvs_body = D[body, dret] in dargs {*+ dfvs*}
+    # Where the returned set is:
+    #  - the derivatives wrt each arg, whether or not it was free in the body.
+    # and TODO: {*+ dfvs*}
+    #  - the derivatives wrt each free var in lambda, in the order returned in [dfvs]
+    #    hence dfvs is a list, rather than a set, to emphasize the order dependence.
+    print(f"make_vjp: lambda {e.id}")
+    fvs_body_0 = freevars(e.body)
+
+    dret = make_new_var(fvs_body_0, Var("dret"))
+    drets = [dret]
+
+    dfvs_body, dbody = make_vjp(e.body, drets)
+    # assert {d(v) for v in fvs_body_0} == set(dfvs_body)
+
+    # Any args not in fvs_body will have zero gradient contributions, but must be
+    # returned in args order
+    dargs = set(d(arg) for arg in e.args)
+    dfvs = [dfv for dfv in dfvs_body if dfv not in dargs and not is_global(dfv)]
+
+    dargs_assigned = [
+        d(arg) if d(arg) in dfvs_body else _zeros_like(arg) for arg in e.args
+    ]
+    dbody_with_args = Let([Eqn(dfvs_body, dbody)], mkTuple(dargs_assigned))
+
+    dlam = Lambda(e.args + drets, dbody_with_args, e.id + "/vjp")
+
+    if dfvs:
+        print(f"make_vjp: {len(dfvs)} free vars in lambda not in args: {dfvs}")
+
+    return dfvs, dlam

@@ -33,6 +33,7 @@ def better_repr(val):
 
 
 # ChatGPT generated - looks ok....
+# https://chatgpt.com/c/682da1e3-f7f0-8010-b2a8-cf9ce44b4007
 
 import ast
 from typing import Set, List, Optional
@@ -46,7 +47,7 @@ class FreeVarAnalyzer(ast.NodeVisitor):
     def __init__(self, global_names: Optional[Set[str]] = None):
         # Stack of bound variable sets for each scope
         self.bound_stack: List[Set[str]] = [set()]
-        # If provided, global names are considered bound in the outermost scope
+
         if global_names is not None:
             self.bound_stack = [global_names] + self.bound_stack
         # Collected free variable names
@@ -84,6 +85,13 @@ class FreeVarAnalyzer(ast.NodeVisitor):
         # Visit value (right side)
         self.visit(node.value)
 
+    def visit_Assign(self, node: ast.AugAssign):
+        # Visit value (right side), might use the lhs name
+        self.visit(node.value)
+        # Visit targets (left side) to bind them
+        for target in node.targets:
+            self.visit(target)
+
     def visit_Name(self, node: ast.Name):
         if isinstance(node.ctx, ast.Store):
             # Binding occurrence: add to current scope
@@ -104,6 +112,27 @@ class FreeVarAnalyzer(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute):
         # Only visit the value, attribute names are not separate variables
         self.visit(node.value)
+
+    def visit_Expr(self, node: ast.Expr):
+        # Special case: x.append(...) or similar method call
+        # Assume the object (x) is a possible mutation target
+        if isinstance(node.value, ast.Call) and isinstance(
+            node.value.func, ast.Attribute
+        ):
+            self._mark_possible_mutation_target(node.value.func.value)
+        self.generic_visit(node)
+
+    def _mark_possible_mutation_target(self, node):
+        if isinstance(node, ast.Name):
+            assert isinstance(node.ctx, ast.Load)
+            # use the name
+            self.visit_Name(node)
+            # and then bind the name
+            self.visit_Name(ast.Name(id=node.id, ctx=ast.Store()))
+        else:
+            # Recursively handle e.g. subscripts like a[0].x.append()
+            for child in ast.iter_child_nodes(node):
+                self._mark_possible_mutation_target(child)
 
     def generic_visit(self, node):
         super().generic_visit(node)
