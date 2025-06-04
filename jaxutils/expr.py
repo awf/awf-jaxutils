@@ -19,6 +19,38 @@ warn = print
 
 
 ### TODO: General utils - should move elsewhere
+def get_function_shortname(f: Callable) -> str:
+    """
+    Get the short name of a function, which is used for logging.
+    """
+    if hasattr(f, "shortname"):
+        return f.shortname
+    if hasattr(f, "__name__"):
+        return f.__name__
+    return str(f)
+
+
+_all_shortnames = {}
+
+
+def shortname(s: str):
+    """
+    A decorator to add a shortname to a function.
+    This is used for logging purposes.
+    """
+
+    def wrapper(func):
+        if not hasattr(func, "shortname"):
+            if _all_shortnames.get(s, func) != func:
+                print(f"Shortname {s} already used, for func {func}")
+            _all_shortnames[s] = func
+
+            func.shortname = s
+        return func
+
+    return wrapper
+
+
 def dictassign(d: Dict[Any, Callable], key: Any):
     """
     A decorator to add functions to dicts.
@@ -223,6 +255,10 @@ class Let(Expr):
 LambdaId = str
 
 
+def extend_id(id: LambdaId, transform: Callable) -> LambdaId:
+    return id + "/" + get_function_shortname(transform)
+
+
 @exprclass
 class Lambda(Expr):
     args: List[Var]
@@ -275,12 +311,16 @@ def _add(e1: Expr, e2: Expr) -> Call:
     return Call(Var("operator.__add__"), [e1, e2])
 
 
-def transform_postorder(name: str, transformer: Callable[[Expr, Dict], Expr], *args):
+def transform_postorder(transformer: Callable[[Expr, Dict], Expr], *args):
     if len(args) == 0:
-        # Make transform(name, transformer)(e) work like transform(name, transformer, e)
-        return lambda *args: transform_postorder(name, transformer, *args)
+        # decorator mode
+        # Make transform(transformer)(e) work like transform(transformer, e)
+        l = lambda *args: transform_postorder(transformer, *args)
+        l.__name__ = transformer.__name__
+        l.shortname = transformer.shortname
+        return l
 
-    recurse = lambda e, bindings: transform_postorder(name, transformer, e, bindings)
+    recurse = lambda e, bindings: transform_postorder(transformer, e, bindings)
 
     e, bindings = args
 
@@ -293,7 +333,9 @@ def transform_postorder(name: str, transformer: Callable[[Expr, Dict], Expr], *a
             new_val = recurse(eqn.val, new_bindings)
             new_vars = list(recurse(var, new_bindings) for var in eqn.vars)
             # And add the equation with the new value
-            new_eqns += [Eqn(new_vars, new_val)]
+            new_eqn = Eqn(new_vars, new_val)
+            # new_eqn = recurse(new_eqn, new_bindings)
+            new_eqns += [new_eqn]
             # Add the new value to the bindings
             if len(new_vars) == 1:
                 new_bindings[one(new_vars).name] = new_val
@@ -310,7 +352,8 @@ def transform_postorder(name: str, transformer: Callable[[Expr, Dict], Expr], *a
             new_bindings[arg.name] = None
         new_body = recurse(e.body, new_bindings)
         new_args = list(recurse(v, new_bindings) for v in e.args)
-        e = Lambda(new_args, new_body, e.id + "/" + name, annot=new_body.annot)
+        new_id = extend_id(e.id, transformer)
+        e = Lambda(new_args, new_body, new_id, annot=new_body.annot)
 
     if e.isCall:
         new_f = recurse(e.f, bindings)
@@ -443,24 +486,12 @@ def signature(e):
 def optimize(e: Expr) -> Expr:
     from jaxutils.expr_ast import ex2py
 
-    def run(transformation_name, ex, transformation=None):
-        print(f"Running {transformation_name}")
-        if not transformation:
-            if transformation_name.startswith("t-"):
-                transformation = globals()[transformation_name[2:]]
-                transformation = transform_postorder(
-                    transformation_name, transformation
-                )
-            else:
-                transformation = globals()[transformation_name]
+    def run(transformation, ex, wrapper=None):
+        print(f"Running {transformation.shortname}:{transformation.__name__}")
 
-        new_ex = (
-            transformation(ex, {})
-            if transformation != uniquify_names
-            else uniquify_names(ex)
-        )
+        new_ex = transformation(ex, {})
 
-        ex2py(f"{run.count:02d}-{transformation_name}", new_ex)
+        ex2py(f"{run.count:02d}-{transformation.__name__}", new_ex)
         run.count += 1
 
         sig = signature(ex)
@@ -474,8 +505,8 @@ def optimize(e: Expr) -> Expr:
 
     print(f"Starting optimization, {str(signature(e))[:80]}")
     ex2py(f"00-before-optimization", e)
-    e = run("uniquify_names", e)
     for t in (
+        uniquify_names,
         elide_empty_lhs,
         inline_call_of_lambda,
         inline_trivial_letbody,
@@ -483,23 +514,20 @@ def optimize(e: Expr) -> Expr:
         inline_lambda_of_let_of_call,
         identify_identities,
         eliminate_identities,
+        to_anf,
+        detuple_tuple_assignments,
+        inline_trivial_assignments,
+        eliminate_identities,
+        inline_trivial_assignments,
     ):
-        e = run("t-" + t.__name__, e, transform_postorder(t.__name__, t))
-
-    e = run("to_anf", e)
-    e = run("t-detuple_tuple_assignments", e)
-    e = run("inline_trivial_assignments", e)
-
-    for t in (eliminate_identities,):
-        e = run("t-" + t.__name__, e, transform_postorder(t.__name__, t))
-
-    e = run("inline_trivial_assignments", e)
-
+        e = run(t, e)
     ex2py(f"99-after-optimization", e)
 
     return e
 
 
+@transform_postorder
+@shortname("icl")
 def inline_call_of_lambda(e: Expr, bindings: Dict[str, Any]) -> Expr:
     # call(lambda l_args: body, args)
     #  ->  let l_args = args in body
@@ -508,6 +536,8 @@ def inline_call_of_lambda(e: Expr, bindings: Dict[str, Any]) -> Expr:
         return Let([Eqn(e.f.args, mkTuple(e.args))], e.f.body)
 
 
+@transform_postorder
+@shortname("ill")
 def inline_lambda_of_let_of_call(e: Expr, bindings: Dict[str, Any]) -> Expr:
     # lambda args: let eqns in call(f, args)
     #  ->  let eqns in f
@@ -517,6 +547,8 @@ def inline_lambda_of_let_of_call(e: Expr, bindings: Dict[str, Any]) -> Expr:
             return Let(e.body.eqns, e.body.body.f)
 
 
+@transform_postorder
+@shortname("itb")
 def inline_trivial_letbody(e: Expr, bindings: Dict[str, Any]) -> Expr:
     # let var = val in var -> val
     if e.isLet and len(e.eqns) == 1 and len(e.eqns[0].vars) == 1:
@@ -526,6 +558,8 @@ def inline_trivial_letbody(e: Expr, bindings: Dict[str, Any]) -> Expr:
         return e.body
 
 
+@transform_postorder
+@shortname("ilc")
 def inline_lambda_of_call(e: Expr, bindings: Dict[str, Any]) -> Expr:
     # Lambda(args, Call(f, args)) -> f
     if e.isLambda:
@@ -572,6 +606,7 @@ def compute_variable_use_counts(e: Expr) -> Expr:
     return var_to_count
 
 
+@shortname("isu")
 def inline_single_usages(e: Expr) -> Expr:
     # let
     #   v1 = e1
@@ -611,13 +646,14 @@ def inline_single_usages(e: Expr) -> Expr:
             for arg in e.args:
                 inner_var_to_val[arg.name] = arg
             body = recurse(e.body, inner_var_to_val)
-            return Lambda(e.args, body, e.id + "/isu")
+            return Lambda(e.args, body, extend_id(e.id, inline_single_usages))
 
         assert False
 
     return recurse(e, {})
 
 
+@shortname("dce")
 def dce(e: Expr) -> Expr:
     """
     Dead Code Elimination
@@ -669,7 +705,7 @@ def dce(e: Expr) -> Expr:
             for arg in e.args:
                 local_var_to_count[arg.name] = 0
             body = recurse(e.body, local_var_to_count)
-            return Lambda(e.args, body, e.id + "/dce")
+            return Lambda(e.args, body, extend_id(e.id, dce))
 
         assert False
 
@@ -677,6 +713,7 @@ def dce(e: Expr) -> Expr:
     return recurse(e, var_to_count)
 
 
+@shortname("dtl")
 def detuple_lets(e: Expr) -> Expr:
     # Let([Eqn([a, b, c], v),
     #       body) ->
@@ -708,9 +745,11 @@ def detuple_lets(e: Expr) -> Expr:
         new_eqns = list(chain(*map(detuple_eqn, e.eqns)))
         return Let(new_eqns, e.body)
 
-    return transform_postorder("dtl", doit, e, {})
+    return transform_postorder(doit, e, {})
 
 
+@transform_postorder
+@shortname("dta")
 def detuple_tuple_assignments(e: Expr, bindings: Dict[str, Any]) -> Expr:
     # Let([Eqn([a, b, c], Call(tuple, [aprime, bprime, cprime]))],
     #       body) ->
@@ -769,8 +808,9 @@ def detuple_tuple_assignments(e: Expr, bindings: Dict[str, Any]) -> Expr:
 #     cse(e)
 
 
+@shortname("anf")
 def to_anf(e, bindings):
-    e = uniquify_names(e)
+    e = uniquify_names(e, bindings)
     assignments = []
     expr = to_anf_aux(e, assignments, bindings)
     return Let(assignments, expr)
@@ -788,7 +828,8 @@ def to_anf_aux(e, assignments, bindings):
         return abody
 
     if e.isLambda:
-        return Lambda(e.args, to_anf(e.body, bindings), e.id + "/anf")
+        new_id = extend_id(e.id, to_anf)
+        return Lambda(e.args, to_anf(e.body, bindings), new_id)
 
     if e.isCall:
         new_f = to_anf_aux(e.f, assignments, bindings)
@@ -798,6 +839,7 @@ def to_anf_aux(e, assignments, bindings):
     assert False
 
 
+@shortname("ita")
 def inline_trivial_assignments(e, bindings):
     return inline_trivial_assignments_aux(e, bindings)
 
@@ -857,7 +899,8 @@ def inline_trivial_assignments_aux(e: Expr, translations: Dict[Var, Expr]):
         }
         assert all(v not in new_translations for v in e.args)
         new_body = recurse(e.body, new_translations)
-        return Lambda(e.args, new_body, e.id + "/ita")
+        new_id = extend_id(e.id, inline_trivial_assignments)
+        return Lambda(e.args, new_body, new_id)
 
     if e.isCall:
         new_f = recurse(e.f, translations)
@@ -891,6 +934,7 @@ def test_inline_trivial_assignments():
     assert out == expect
 
 
+@shortname("l2l")
 def let_to_lambda(e: Expr, bindings: Dict[str, Any]) -> Expr:
     """
     let x1 = val1, x2 = val2 in body
@@ -908,6 +952,8 @@ def let_to_lambda(e: Expr, bindings: Dict[str, Any]) -> Expr:
         return Call(Lambda(args, e.body, "l2l_" + get_new_name()), vals)
 
 
+@transform_postorder
+@shortname("eel")
 def elide_empty_lhs(e: Expr, bindings: Dict[str, Any]) -> Expr:
     """
     let [] = val1, x2 = val2 in body
@@ -919,6 +965,8 @@ def elide_empty_lhs(e: Expr, bindings: Dict[str, Any]) -> Expr:
         return Let(eqns, e.body)
 
 
+@transform_postorder
+@shortname("iid")
 def identify_identities(e: Expr, bindings: Dict[str, Any]) -> Expr:
     """
     lambda x: x -> g_identity
@@ -927,6 +975,8 @@ def identify_identities(e: Expr, bindings: Dict[str, Any]) -> Expr:
         return Var("g_identity")
 
 
+@transform_postorder
+@shortname("eid")
 def eliminate_identities(e: Expr, bindings: Dict[str, Any]) -> Expr:
     """
     g_identity(args) -> args
@@ -961,7 +1011,8 @@ def make_new_var(var_container: Set[Var], v: Var) -> Var:
     return Var(newname, annot=v.annot)
 
 
-def uniquify_names(e: Expr) -> Expr:
+@shortname("unq")
+def uniquify_names(e: Expr, _bindings) -> Expr:
     # To start with, add freevars to scope, with their own names
     translations = {v.name: v.name for v in freevars(e)}
     all_names = set(translations.keys())
@@ -1003,7 +1054,8 @@ def uniquify_names(e: Expr) -> Expr:
                 new_vars += [Var(newname, annot=var.annot)]
 
             new_body = doit(e.body, new_translations)
-            return Lambda(new_vars, new_body, e.id + "/unq", annot=e.annot)
+            new_id = e.id + "/" + get_function_shortname(uniquify_names)
+            return Lambda(new_vars, new_body, new_id, annot=e.annot)
 
         if e.isLet:
             # Commandeer new names for everyone in this let
@@ -1050,7 +1102,7 @@ def test_uniquify_names():
         ),
     )
     print(e)
-    out = uniquify_names(e)
+    out = uniquify_names(e, {})
     print(out)
     assert out.eqns[0].vars[0] != a
     assert out.eqns[0].val == a
@@ -1074,11 +1126,12 @@ def test_uniquify_names():
 ########################################################################################
 
 
+@shortname("ssa")
 def to_ssa(e: Expr) -> Let | Var | Const | Lambda:
     """
     Convert an expression to SSA form.
     """
-    e = uniquify_names(e)
+    e = uniquify_names(e, {})
 
     if e.isConst or e.isVar:
         return e

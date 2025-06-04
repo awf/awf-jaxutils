@@ -61,7 +61,7 @@ def test_visit():
 
 def test_let_to_lambda():
     e = _make_e()
-    l = transform_postorder("let_to_lambda", let_to_lambda, e, {})
+    l = transform_postorder(let_to_lambda, e, {})
 
     def check(e):
         assert not e.isLet

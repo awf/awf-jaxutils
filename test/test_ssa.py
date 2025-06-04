@@ -79,7 +79,7 @@ def test_uniquify():
     e = parse_expr(example)
     print(_tostr(e))
 
-    u = jex.uniquify_names(e)
+    u = jex.uniquify_names(e, {})
     ustr = _tostr(u)
     print(ustr)
 
@@ -90,7 +90,7 @@ def test_uniquify():
     assert ustr == exstr
 
     # Check that doing it again doesn't change any more names
-    u2 = jex.uniquify_names(u)
+    u2 = jex.uniquify_names(u, {})
     u2str = _tostr(u2)
     print(ustr)
     assert u2str == ustr
@@ -189,7 +189,7 @@ def test_to_ssa_ffn():
 
     e = jex.detuple_lets(e)
 
-    e = jex.uniquify_names(e)
+    e = jex.uniquify_names(e, {})
     ucs = jex.compute_variable_use_counts(e)
     for k, v in ucs.items():
         print(k, v)
@@ -260,7 +260,7 @@ def test_ssa_for_loop_accum():
     e = annotate_with_shadow_types(e, (x,), shadow_bindings)
     check(e)
 
-    e = global_getattrs_to_names(e)
+    e = global_getattrs_to_names(e, {})
     check(e)
 
     print(expr_to_python_code(e, "ssa"))

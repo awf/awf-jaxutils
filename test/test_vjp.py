@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from jaxutils.expr import shortname
 from jaxutils.expr_eval import eval_expr
 from jaxutils.vjp import softmax, relu
 
@@ -109,7 +110,7 @@ def test_to_ssa_ffn():
 
     e = jex.detuple_lets(e)
 
-    e = jex.uniquify_names(e)
+    e = jex.uniquify_names(e, {})
     ucs = jex.compute_variable_use_counts(e)
     for k, v in ucs.items():
         print(k, v)
@@ -250,20 +251,19 @@ from jaxutils.array_expr import (
 )
 
 
-def inline_var_eq_var(e):
-    def transform(e, bindings):
-        if e.isLet:
-            new_eqns = []
-            for eqn in e.eqns:
-                new_val = eqn.val
-                if eqn.val.isVar and eqn.val.name in bindings:
-                    # Inline the variable
-                    new_val = bindings[eqn.val.name]
+@transform_postorder
+@shortname("v2v")
+def inline_var_eq_var(e, bindings):
+    if e.isLet:
+        new_eqns = []
+        for eqn in e.eqns:
+            new_val = eqn.val
+            if eqn.val.isVar and eqn.val.name in bindings:
+                # Inline the variable
+                new_val = bindings[eqn.val.name]
 
-                new_eqns += [Eqn(eqn.vars, new_val)]
-            return Let(new_eqns, e.body)
-
-    return transform_postorder("v=v", transform, e, {})
+            new_eqns += [Eqn(eqn.vars, new_val)]
+        return Let(new_eqns, e.body)
 
 
 from jaxutils.vjp import softmax, relu, transpose
@@ -386,7 +386,7 @@ def test_vjp(funcname, opt, ssa):
         val = eval_expr(e, (W1, b1, W2, b2, x), bindings, add_operators=False)
         np.testing.assert_allclose(ret, val, atol=1e-4)
 
-    e = jex.uniquify_names(e)  # TODO: remove
+    e = jex.uniquify_names(e, {})  # TODO: remove
 
     print(expr_to_python_code(e, funcname))
 
@@ -397,7 +397,7 @@ def test_vjp(funcname, opt, ssa):
     print(expr_to_python_code(e, funcname))
 
     e = annotate_expr_base(e)  # needed before vjp
-    e = global_getattrs_to_names(e)
+    e = global_getattrs_to_names(e, {})
 
     dfuncname = "d" + e.body.name
     fvs, vjp_raw = jex.make_vjp(e, [Var(dfuncname)])
@@ -406,15 +406,15 @@ def test_vjp(funcname, opt, ssa):
     code = expr_to_python_code(vjp_raw, dfuncname)
     print(code)
 
-    if opt == "raw":
-        vjp = vjp_raw
-    elif opt == "opt":
+    vjp = vjp_raw
+    if opt == "opt":
         vjp = jex.optimize(vjp_raw)
         vjp = jex.dce(vjp)
-    else:
-        raise ValueError(f"Unknown optimization option: {opt}")
+        # vjp = jex.inline_trivial_assignments(vjp, {})
+        # vjp = inline_var_eq_var(vjp, {})
+        pass
 
-    vjp = strip_annotations(vjp)
+    vjp = strip_annotations(vjp, {})
 
     print("\n\n*** VJP ***")
     code = expr_to_python_code(vjp, dfuncname)

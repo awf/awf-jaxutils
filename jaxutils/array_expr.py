@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 from typing import Sequence, Any
 
-from jaxutils.expr import Expr, Var, Call, transform_postorder
+from jaxutils.expr import Expr, Var, Call, transform_postorder, shortname
 from jaxutils.expr_lib import g_identity
 from jaxutils.expr_eval import annotate_eval
 
@@ -34,11 +34,12 @@ def annotate_with_shadow_types(
     e = annotate_eval(e, shadow_args, shadow_bindings)
 
     # Now strip any annots that are not ShadowArrays
+    @shortname("snsa")
     def strip_non_shadow_annot(e, _bindings):
         if not isinstance(e.annot, (ShadowArray, type)):
             return replace(e, annot=type(e.annot))
 
-    e = transform_postorder("snsa", strip_non_shadow_annot, e, {})
+    e = transform_postorder(strip_non_shadow_annot, e, {})
 
     return e
 
@@ -199,24 +200,22 @@ def get_shadow_bindings_for_jax():
     }
 
 
-def strip_annotations(e: Expr) -> Expr:
-    def doit(e, _bindings):
-        return replace(e, annot=None)
+@transform_postorder
+@shortname("san")
+def strip_annotations(e: Expr, _bindings) -> Expr:
+    return replace(e, annot=None)
 
-    return transform_postorder("strip_annotations", doit, e, {})
 
-
-def global_getattrs_to_names(e):
-    def transform(e, bindings):
-        if e.isCall and e.f.isVar and e.f.name == "getattr":
-            obj = e.args[0]
-            attr = e.args[1]
-            if obj.isVar and obj.name not in bindings:
-                # It's a reference to a global variable, assume it's a module
-                return Var(f"{obj.name}.{attr.val}")
-            if attr.val == "T":
-                if not isinstance(obj.annot, (jnp.ndarray, ShadowArray)):
-                    print(f"Warning: Assuming {obj.name}.T is a transpose")
-                return Call(Var("transpose"), [obj])
-
-    return transform_postorder("ga2n", transform, e, {})
+@transform_postorder
+@shortname("ga2n")
+def global_getattrs_to_names(e, bindings):
+    if e.isCall and e.f.isVar and e.f.name == "getattr":
+        obj = e.args[0]
+        attr = e.args[1]
+        if obj.isVar and obj.name not in bindings:
+            # It's a reference to a global variable, assume it's a module
+            return Var(f"{obj.name}.{attr.val}")
+        if attr.val == "T":
+            if not isinstance(obj.annot, (jnp.ndarray, ShadowArray)):
+                print(f"Warning: Assuming {obj.name}.T is a transpose")
+            return Call(Var("transpose"), [obj])

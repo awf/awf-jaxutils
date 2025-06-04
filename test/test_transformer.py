@@ -289,7 +289,7 @@ def my_getattr(obj, attr):
 #                         return Var(f"{val.__name__}.{attr}")
 #             pass
 
-#     return jex.transform_postorder("resolve_getattr", doit, e, bindings or {})
+#     return jex.transform_postorder(doit, e, bindings or {})
 
 
 def test_transformer_vjp():
@@ -313,7 +313,7 @@ def test_transformer_vjp():
     # bindings = {"jax": jax, "jnp": jnp, "jax.nn": jax.nn}
     # e = resolve_getattr(e, bindings)
 
-    e = jex.uniquify_names(e)
+    e = jex.uniquify_names(e, {})
     vars, vjp = jex.make_vjp(e, [jex.Var("f")])
 
     with open("tmp/transformer_vjp.py", "w") as f:
