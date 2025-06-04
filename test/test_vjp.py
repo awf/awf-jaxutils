@@ -254,16 +254,13 @@ from jaxutils.array_expr import (
 @transform_postorder
 @shortname("v2v")
 def inline_var_eq_var(e, bindings):
-    if e.isLet:
-        new_eqns = []
-        for eqn in e.eqns:
-            new_val = eqn.val
-            if eqn.val.isVar and eqn.val.name in bindings:
-                # Inline the variable
-                new_val = bindings[eqn.val.name]
+    if e.isEqn:
+        new_val = e.val
+        while new_val.isVar and new_val.name in bindings and bindings[new_val.name]:
+            # Inline the variable
+            new_val = bindings[new_val.name]
 
-            new_eqns += [Eqn(eqn.vars, new_val)]
-        return Let(new_eqns, e.body)
+        return Eqn(e.vars, new_val)
 
 
 from jaxutils.vjp import softmax, relu, transpose
@@ -408,10 +405,11 @@ def test_vjp(funcname, opt, ssa):
 
     vjp = vjp_raw
     if opt == "opt":
-        vjp = jex.optimize(vjp_raw)
-        vjp = jex.dce(vjp)
+        # vjp = jex.optimize(vjp_raw)
+        # vjp = jex.dce(vjp)
         # vjp = jex.inline_trivial_assignments(vjp, {})
-        # vjp = inline_var_eq_var(vjp, {})
+        vjp = inline_var_eq_var(vjp, {})
+        vjp = jex.dce(vjp)
         pass
 
     vjp = strip_annotations(vjp, {})

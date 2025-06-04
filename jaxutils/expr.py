@@ -174,6 +174,10 @@ class Expr:
     def isLet(self):
         return isinstance(self, Let)
 
+    @property
+    def isEqn(self):
+        return isinstance(self, Eqn)
+
     def __str__(self):
         return expr_format(self)
 
@@ -215,7 +219,7 @@ class Const(Expr):
     annot: Any = None
 
     def __hash__(self):
-        return hash(Const, self.val)
+        return hash((Const, self.val))
 
 
 @exprclass
@@ -233,10 +237,16 @@ class Var(Expr):
         return isinstance(b, Var) and self.name == b.name
 
 
-@dataclass(frozen=True)
-class Eqn:
+@exprclass
+class Eqn(Expr):
     vars: List[Var]
     val: Expr
+
+    # [Note 1]:
+    annot: Any = None
+
+    def __hash__(self):
+        return hash((Eqn, self.vars, self.val))
 
 
 @exprclass
@@ -248,15 +258,11 @@ class Let(Expr):
     annot: Any = None
 
     def __hash__(self):
-        return hash(Let, self.eqns, self.body)
+        return hash((Let, self.eqns, self.body))
 
 
 # Lambdas are kinda singletons, this id is useful to keep track of them
 LambdaId = str
-
-
-def extend_id(id: LambdaId, transform: Callable) -> LambdaId:
-    return id + "/" + get_function_shortname(transform)
 
 
 @exprclass
@@ -269,7 +275,7 @@ class Lambda(Expr):
     annot: Any = None
 
     def __hash__(self):
-        return hash(Lambda, self.args, self.body, self.id)
+        return hash((Lambda, self.args, self.body, self.id))
 
 
 @exprclass
@@ -281,7 +287,7 @@ class Call(Expr):
     annot: Any = None
 
     def __hash__(self):
-        return hash(Call, self.f, self.args)
+        return hash((Call, self.f, self.args))
 
 
 ########################################################################################
@@ -311,6 +317,10 @@ def _add(e1: Expr, e2: Expr) -> Call:
     return Call(Var("operator.__add__"), [e1, e2])
 
 
+def extend_id(id: LambdaId, transform: Callable) -> LambdaId:
+    return id + "/" + get_function_shortname(transform)
+
+
 def transform_postorder(transformer: Callable[[Expr, Dict], Expr], *args):
     if len(args) == 0:
         # decorator mode
@@ -334,7 +344,7 @@ def transform_postorder(transformer: Callable[[Expr, Dict], Expr], *args):
             new_vars = list(recurse(var, new_bindings) for var in eqn.vars)
             # And add the equation with the new value
             new_eqn = Eqn(new_vars, new_val)
-            # new_eqn = recurse(new_eqn, new_bindings)
+            new_eqn = recurse(new_eqn, new_bindings)
             new_eqns += [new_eqn]
             # Add the new value to the bindings
             if len(new_vars) == 1:
@@ -653,6 +663,21 @@ def inline_single_usages(e: Expr) -> Expr:
     return recurse(e, {})
 
 
+def splitlet(e):
+    assert e.isLet and len(e.eqns) > 0
+    vars = e.eqns[0].vars
+    val = e.eqns[0].val
+    new_let = Let(e.eqns[1:], e.body)
+    return vars, val, new_let
+
+
+def prependlet(vars, val, e):
+    if e.isLet:
+        return Let([Eqn(vars, val)] + e.eqns, e.body)
+    else:
+        return Let([Eqn(vars, val)], e)
+
+
 @shortname("dce")
 def dce(e: Expr) -> Expr:
     """
@@ -660,57 +685,68 @@ def dce(e: Expr) -> Expr:
     Remove bindings to unused variables.
     """
 
-    def recurse(e, var_to_count):
+    # dce(k) = {}, k
+    # dce(v) = {v}, v  # As only called on rhs vars
+    # dce(f (e1..n)) = fvsf, f' = dce(f, bindings):
+    #                  fvs1, e1' = dce(e1, bindings)
+    #                  fvs2, e2' = dce(e2, bindings)
+    #                  ...
+    #                  fvsf + fvs1 + fvs2 + ... , Call(f', [e1', e2', ...])
+    # dce(e) -> (fvs, e')
+    # where fvs is the set of free variables in e'
+    # dce(let v = e1 in e2) = {
+    #                          fvs1, e1' = dce(e1, bindings)
+    #                          fvse2, e2' = dce(e2, bindings + {v})
+    #                         }:
+    #                         fv1 | fvs2, let v = e1' in e2' {if v in fvs}
+    #                         fvs2, e2'                      {if v not in fvs}
+    # dce(lambda xs. e) = fvs, e' = dce(e, bindings + {xs})
+
+    def recurse(e, bindings):
         if e.isConst:
-            return e
+            return set(), e
 
         if e.isVar:
-            var_to_count[e.name] += 1
-            return e
+            return {e} - bindings, e
 
         if e.isLet:
-            local_var_to_count = var_to_count.copy()
-            new_vals = []
-            for eqn in e.eqns:
-                val = recurse(eqn.val, local_var_to_count)
-                for var in eqn.vars:
-                    local_var_to_count[var.name] = 0
-                new_vals += [val]
-            body = recurse(e.body, local_var_to_count)
+            if len(e.eqns) == 0:
+                return recurse(e.body, bindings)
 
-            new_eqns = []
-            for eqn, val in zip(e.eqns, new_vals):
-                any_used = any(local_var_to_count[var.name] > 0 for var in eqn.vars)
-                if any_used:
-                    # Replace any unused with "_"
-                    new_vars = [
-                        var if local_var_to_count[var.name] > 0 else Var("_")
-                        for var in eqn.vars
-                    ]
-                    new_eqns += [Eqn(new_vars, val)]
-
-            if not new_eqns:
-                # If no equations left, just return the body
-                return body
+            # peel one equation at a time
+            # dce(let var = e1 in body) =
+            #      {
+            #       fvs1, e1' = dce(e1, bindings)
+            #       fvsbody, body' = dce(body, bindings + {var})
+            #      }:
+            #      fv1 | fvs2, let v = e1' in e2' {if v in fvsbody}
+            #      fvs2, e2'                      {if v not in fvs}
+            vars, e1, body = splitlet(e)
+            fvs1, new_e1 = recurse(e1, bindings)
+            fvsbody, new_body = recurse(body, bindings | set(vars))
+            if not (set(vars) < fvsbody):
+                return fvs1 | fvsbody, prependlet(vars, new_e1, new_body)
             else:
-                return Let(new_eqns, body)
+                return fvsbody, new_body
 
         if e.isCall:
-            f = recurse(e.f, var_to_count)
-            args = [recurse(a, var_to_count) for a in e.args]
-            return Call(f, args)
+            fvs, new_f = recurse(e.f, bindings)
+            new_args = []
+            for a in e.args:
+                fvs_a, new_a = recurse(a, bindings)
+                new_args += [new_a]
+                fvs |= fvs_a
+
+            return fvs, Call(new_f, new_args)
 
         if e.isLambda:
-            local_var_to_count = var_to_count.copy()
-            for arg in e.args:
-                local_var_to_count[arg.name] = 0
-            body = recurse(e.body, local_var_to_count)
-            return Lambda(e.args, body, extend_id(e.id, dce))
+            fvs, new_body = recurse(e.body, bindings | set(e.args))
+            return fvs, Lambda(e.args, new_body, extend_id(e.id, dce))
 
         assert False
 
-    var_to_count = defaultdict(lambda: 0)
-    return recurse(e, var_to_count)
+    fvs, e = recurse(e, set())
+    return e
 
 
 @shortname("dtl")
