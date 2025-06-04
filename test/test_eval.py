@@ -18,7 +18,7 @@ def test_eval():
 
     f_defs = {
         "add": operator.add,
-        "tuple": lambda *args: tuple(args),
+        "g_tuple": lambda *args: tuple(args),
         "getattr": getattr,
     }
 
@@ -29,7 +29,7 @@ def test_eval():
     v = _run_eval(
         Let(
             [
-                Eqn([a, b], Call(Var("tuple"), [Const(2), Const(3)])),
+                Eqn([a, b], Call(Var("g_tuple"), [Const(2), Const(3)])),
             ],
             Call(Var("add"), [a, b]),
         ),

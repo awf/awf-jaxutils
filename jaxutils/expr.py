@@ -325,14 +325,23 @@ def transform_postorder(transformer: Callable[[Expr, Dict], Expr], *args):
     if len(args) == 0:
         # decorator mode
         # Make transform(transformer)(e) work like transform(transformer, e)
-        l = lambda *args: transform_postorder(transformer, *args)
+        l = lambda *args: transform_postorder_aux(transformer, *args)
         l.__name__ = transformer.__name__
         l.shortname = transformer.shortname
         return l
+    else:
+        # Call mode
+        # transform(transformer, e)
+        e = args[0]
+        bindings = args[1] if len(args) > 1 else {}
+        return transform_postorder_aux(transformer, e, bindings)
 
-    recurse = lambda e, bindings: transform_postorder(transformer, e, bindings)
 
-    e, bindings = args
+@beartype
+def transform_postorder_aux(
+    transformer: Callable[[Expr, Dict], Expr], e: Expr, bindings: Dict[Var, Any]
+) -> Expr:
+    recurse = lambda e, bindings: transform_postorder_aux(transformer, e, bindings)
 
     # Recurse into children
     if e.isLet:
@@ -348,10 +357,10 @@ def transform_postorder(transformer: Callable[[Expr, Dict], Expr], *args):
             new_eqns += [new_eqn]
             # Add the new value to the bindings
             if len(new_vars) == 1:
-                new_bindings[one(new_vars).name] = new_val
+                new_bindings[one(new_vars)] = new_val
             else:
                 for i, var in enumerate(new_vars):
-                    new_bindings[var.name] = _subscript(new_val, i)
+                    new_bindings[var] = _subscript(new_val, i)
 
         new_body = recurse(e.body, new_bindings)
         e = Let(new_eqns, new_body, annot=new_body.annot)
@@ -359,7 +368,7 @@ def transform_postorder(transformer: Callable[[Expr, Dict], Expr], *args):
     if e.isLambda:
         new_bindings = bindings.copy()
         for arg in e.args:
-            new_bindings[arg.name] = None
+            new_bindings[arg] = None
         new_body = recurse(e.body, new_bindings)
         new_args = list(recurse(v, new_bindings) for v in e.args)
         new_id = extend_id(e.id, transformer)
@@ -493,7 +502,7 @@ def signature(e):
     return set.union(fvs, {"g_tuple", "g_identity"})
 
 
-def optimize(e: Expr) -> Expr:
+def optimize_old(e: Expr) -> Expr:
     from jaxutils.expr_ast import ex2py
 
     def run(transformation, ex, wrapper=None):
@@ -536,6 +545,80 @@ def optimize(e: Expr) -> Expr:
     return e
 
 
+def optimize(e: Expr) -> Expr:
+    e = retuple(e, {})
+    e = dce(e)
+    e = optimize_old(e)
+    # e = inline_trivial_letbody(e, {})
+    # e = inline_var_eq_var(e, {})
+    # e = dce(e)
+    # e = inline_var_eq_var(e, {})
+    # e = dce(e)
+    return e
+
+
+def lookup(v: Var, bindings: Dict[Var, Expr]) -> Expr:
+    """
+    Lookup a variable in the bindings, following the chain of variables.
+    """
+    while v.isVar and v in bindings and bindings[v]:
+        v = bindings[v]
+    return v
+
+
+def iscall(e: Expr, f: str):
+    """
+    Check if an expression is a call to a function with the given name.
+    """
+    return e.isCall and e.f.isVar and e.f.name == f
+
+
+@transform_postorder
+@shortname("udt")
+def retuple(e, bindings):
+    # if e.isLet:
+    #     if e.body.isCall and e.body.f.isVar and e.body.f.name == "g_tuple":
+    #         # let var0 = a[0] in g_tuple(args)
+    #         #  ->  let vars = args in body
+    #         return Let([Eqn(e.body.args, mkTuple(e.body.args))], e.body)
+    if iscall(e, "g_tuple"):
+        # super-specific pattern, but common from AD and transformations
+        # g_tuple(g_subscript(a, 0), g_subscript(a, 1)) -> mkTuple(a)
+        args = [lookup(arg, bindings) for arg in e.args]
+        shared_val = None
+        if e.args[0].isVar and e.args[0].name == "dW1_0_1c":
+            pass
+        for i, arg in enumerate(args):
+            if not (
+                iscall(arg, "g_subscript")
+                and arg.args[1].isConst
+                and arg.args[1].val == i
+            ):
+                return e
+
+            val = arg.args[0]
+            if shared_val is None:
+                shared_val = val
+            elif shared_val != val:
+                print("g_tuple match failed")
+                return e
+
+        print(e, "->", shared_val)
+        return shared_val
+
+
+@transform_postorder
+@shortname("v2v")
+def inline_var_eq_var(e, bindings):
+    if e.isEqn:
+        new_val = e.val
+        while new_val.isVar and new_val.name in bindings and bindings[new_val.name]:
+            # Inline the variable
+            new_val = bindings[new_val.name]
+
+        return Eqn(e.vars, new_val)
+
+
 @transform_postorder
 @shortname("icl")
 def inline_call_of_lambda(e: Expr, bindings: Dict[str, Any]) -> Expr:
@@ -560,10 +643,15 @@ def inline_lambda_of_let_of_call(e: Expr, bindings: Dict[str, Any]) -> Expr:
 @transform_postorder
 @shortname("itb")
 def inline_trivial_letbody(e: Expr, bindings: Dict[str, Any]) -> Expr:
-    # let var = val in var -> val
-    if e.isLet and len(e.eqns) == 1 and len(e.eqns[0].vars) == 1:
-        if e.eqns[0].vars == [e.body]:
-            return e.eqns[0].val
+    # let vars = val in vars -> val
+    if e.isLet and len(e.eqns) == 1:
+        vars = e.eqns[0].vars
+        val = e.eqns[0].val
+        body = e.body
+        # And is the body a mkTuple of vars
+        if vars == [body]:
+            return val
+
     if e.isLet and len(e.eqns) == 0:
         return e.body
 
@@ -707,7 +795,7 @@ def dce(e: Expr) -> Expr:
             return set(), e
 
         if e.isVar:
-            return {e} - bindings, e
+            return {e}, e
 
         if e.isLet:
             if len(e.eqns) == 0:
@@ -724,8 +812,9 @@ def dce(e: Expr) -> Expr:
             vars, e1, body = splitlet(e)
             fvs1, new_e1 = recurse(e1, bindings)
             fvsbody, new_body = recurse(body, bindings | set(vars))
-            if not (set(vars) < fvsbody):
-                return fvs1 | fvsbody, prependlet(vars, new_e1, new_body)
+            if set(vars) & fvsbody:
+                fvs = fvs1 | (fvsbody - set(vars))
+                return fvs, prependlet(vars, new_e1, new_body)
             else:
                 return fvsbody, new_body
 
@@ -741,6 +830,8 @@ def dce(e: Expr) -> Expr:
 
         if e.isLambda:
             fvs, new_body = recurse(e.body, bindings | set(e.args))
+            fvs -= set(e.args)
+            assert fvs == freevars(e)
             return fvs, Lambda(e.args, new_body, extend_id(e.id, dce))
 
         assert False

@@ -319,7 +319,7 @@ def test_transformer_vjp():
     with open("tmp/transformer_vjp.py", "w") as f:
         print(expr_to_python_code(vjp, "transformer_vjp"), file=f)
 
-    vjpo = jex.optimize(vjp)
+    vjpo = jex.optimize_old(vjp)
 
     with open("tmp/transformer_vjpo.py", "w") as f:
         print(expr_to_python_code(vjpo, "transformer_vjpo"), file=f)

@@ -212,7 +212,7 @@ def global_getattrs_to_names(e, bindings):
     if e.isCall and e.f.isVar and e.f.name == "getattr":
         obj = e.args[0]
         attr = e.args[1]
-        if obj.isVar and obj.name not in bindings:
+        if obj.isVar and obj not in bindings:
             # It's a reference to a global variable, assume it's a module
             return Var(f"{obj.name}.{attr.val}")
         if attr.val == "T":

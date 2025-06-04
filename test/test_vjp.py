@@ -251,18 +251,6 @@ from jaxutils.array_expr import (
 )
 
 
-@transform_postorder
-@shortname("v2v")
-def inline_var_eq_var(e, bindings):
-    if e.isEqn:
-        new_val = e.val
-        while new_val.isVar and new_val.name in bindings and bindings[new_val.name]:
-            # Inline the variable
-            new_val = bindings[new_val.name]
-
-        return Eqn(e.vars, new_val)
-
-
 from jaxutils.vjp import softmax, relu, transpose
 
 
@@ -368,6 +356,11 @@ def annotate_expr_base(e: Expr) -> Expr:
     ],
 )
 def test_vjp(funcname, opt, ssa):
+    def pcode(e, fn):
+        code = expr_to_python_code(e, fn, flat_lets=False)
+        print(code)
+        return code
+
     func = globals()[funcname]
     W1, b1, W2, b2 = W
     ret = func(W1, b1, W2, b2, x)
@@ -385,13 +378,13 @@ def test_vjp(funcname, opt, ssa):
 
     e = jex.uniquify_names(e, {})  # TODO: remove
 
-    print(expr_to_python_code(e, funcname))
+    pcode(e, funcname)
 
     if ssa == "ssa":
         e = to_ssa_tidy(e)
         check(e)
 
-    print(expr_to_python_code(e, funcname))
+    pcode(e, funcname)
 
     e = annotate_expr_base(e)  # needed before vjp
     e = global_getattrs_to_names(e, {})
@@ -400,23 +393,17 @@ def test_vjp(funcname, opt, ssa):
     fvs, vjp_raw = jex.make_vjp(e, [Var(dfuncname)])
 
     print("\n\n*** VJP (RAW) ***")
-    code = expr_to_python_code(vjp_raw, dfuncname)
-    print(code)
+    pcode(vjp_raw, dfuncname)
 
     vjp = vjp_raw
     if opt == "opt":
-        # vjp = jex.optimize(vjp_raw)
-        # vjp = jex.dce(vjp)
-        # vjp = jex.inline_trivial_assignments(vjp, {})
-        vjp = inline_var_eq_var(vjp, {})
-        vjp = jex.dce(vjp)
+        vjp = jex.optimize(vjp_raw)
         pass
 
     vjp = strip_annotations(vjp, {})
 
     print("\n\n*** VJP ***")
-    code = expr_to_python_code(vjp, dfuncname)
-    print(code)
+    code = pcode(vjp, dfuncname)
 
     filename = f"tmp/test_vjp_tmp_{funcname}_{ssa}_{opt}.py"
     with open(filename, "w") as f:

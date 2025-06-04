@@ -97,10 +97,10 @@ def _ast_op_to_Var(op):
         raise ValueError(f"Unknown operator {op}")
 
 
-def to_ast(e, name):
+def to_ast(e, name, flat_lets=False) -> ast.Module:
     var = Var(name)
     assignments = []
-    if expr := to_ast_aux(e, assignments, [var]):
+    if expr := to_ast_aux(e, assignments, [var], flat_lets):
         assignments += [ast.Assign([ast.Name(name, ast.Store())], expr)]
 
     a = ast.Module(body=assignments, type_ignores=[])
@@ -178,7 +178,11 @@ def mkannot(e):
         return None
 
 
-def to_ast_aux(e, assignments, binders=None):
+def to_ast_aux(e, assignments, binders, flat_lets):
+    recurse = lambda e, assignments, binders=None: to_ast_aux(
+        e, assignments, binders, flat_lets
+    )
+
     if e.isConst:
         return to_ast_constant(e.val)
 
@@ -186,14 +190,15 @@ def to_ast_aux(e, assignments, binders=None):
         return ast.Name(e.name, ast.Load())
 
     if e.isLet:
+        local_assignments = []
         for eqn in e.eqns:
             avars = [ast.Name(var.name, ast.Store()) for var in eqn.vars]
             if len(avars) > 1:
                 avars = [ast.Tuple(avars, ast.Store())]
 
-            if aval := to_ast_aux(eqn.val, assignments, binders=eqn.vars):
+            if aval := recurse(eqn.val, local_assignments, binders=eqn.vars):
                 if eqn.val.annot is not None:
-                    assignments += [
+                    local_assignments += [
                         ast.AnnAssign(
                             target=one(avars),
                             value=aval,
@@ -202,9 +207,18 @@ def to_ast_aux(e, assignments, binders=None):
                         )
                     ]
                 else:
-                    assignments += [ast.Assign(targets=avars, value=aval)]
+                    local_assignments += [ast.Assign(targets=avars, value=aval)]
 
-        abody = to_ast_aux(e.body, assignments)
+        abody = recurse(e.body, local_assignments)
+        if flat_lets:
+            assignments += local_assignments
+        else:
+            assignments += [
+                ast.With(
+                    items=[ast.withitem(context_expr=ast.Name("g_let", ast.Load()))],
+                    body=local_assignments,
+                )
+            ]
         return abody
 
     if e.isLambda:
@@ -223,7 +237,7 @@ def to_ast_aux(e, assignments, binders=None):
         ]
 
         # Recurse, generating inner assignments
-        abody = to_ast_aux(e.body, inner_assignments)
+        abody = recurse(e.body, inner_assignments)
         inner_assignments += [ast.Return(abody)]
 
         # Make a FunctionDef
@@ -248,7 +262,7 @@ def to_ast_aux(e, assignments, binders=None):
         if e.f.isVar and e.f.name == "**g_pairs_to_dict":
             # convert to dict call
             keywords = [
-                ast.keyword(arg=k.val, value=to_ast_aux(value, assignments))
+                ast.keyword(arg=k.val, value=recurse(value, assignments))
                 for k, value in zip(e.args[::2], e.args[1::2])
             ]
             dictval = ast.Call(
@@ -260,7 +274,7 @@ def to_ast_aux(e, assignments, binders=None):
         # Special case: g_tuple
         if e.f.isVar and e.f.name == "g_tuple":
             # convert to tuple call
-            elts = [to_ast_aux(a, assignments) for a in e.args]
+            elts = [recurse(a, assignments) for a in e.args]
             return ast.Tuple(elts=elts, ctx=ast.Load())
 
         # Special case: g_subscript
@@ -268,20 +282,20 @@ def to_ast_aux(e, assignments, binders=None):
         if e.f.isVar and e.f.name == "g_subscript":
             # convert to subscript call
             assert len(e.args) == 2
-            value = to_ast_aux(e.args[0], assignments)
-            slices = to_ast_aux(e.args[1], assignments)
+            value = recurse(e.args[0], assignments)
+            slices = recurse(e.args[1], assignments)
             return ast.Subscript(value=value, slice=slices, ctx=ast.Load())
 
         # Special case: g_slice
         if e.f.isVar and e.f.name == "g_slice":
             # convert to slice call
             assert len(e.args) == 3
-            args = (None if isNone(a) else to_ast_aux(a, assignments) for a in e.args)
+            args = (None if isNone(a) else recurse(a, assignments) for a in e.args)
             lower, upper, step = args
             return ast.Slice(lower=lower, upper=upper, step=step)
 
-        args = [to_ast_aux(arg, assignments) for arg in e.args]
-        f = to_ast_aux(e.f, assignments)
+        args = [recurse(arg, assignments) for arg in e.args]
+        f = recurse(e.f, assignments)
 
         if isinstance(f, ast.Name) and f.id.startswith("operator."):
             # Special case: operator.*
@@ -559,6 +573,6 @@ def expr_for(
     return Let(eqns, func_var)
 
 
-def expr_to_python_code(e: Expr, name: str) -> str:
-    as_ast = to_ast(e, name)
+def expr_to_python_code(e: Expr, name: str, flat_lets=True) -> str:
+    as_ast = to_ast(e, name, flat_lets)
     return ast.unparse(as_ast)

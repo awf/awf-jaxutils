@@ -107,3 +107,14 @@ def g_subscript(x, inds):
 # g_slice = Var("g_slice")
 # g_list = Var("g_list")
 # g_identity = Var("g_identity")
+
+
+class _EmptyContextManager:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+
+g_let = _EmptyContextManager()

@@ -279,7 +279,7 @@ def _(*args, **kwargs):
     # be aware of possible quadratic complexity in calling optimize
     update_jaxpr = kwargs.pop("update_jaxpr")
     if not update_jaxpr.isVar:
-        assert jex.optimize(update_jaxpr) == Var("operator.__add__")
+        assert jex.optimize_old(update_jaxpr) == Var("operator.__add__")
 
     # Hope update_consts is Const(())
     assert not kwargs.pop("update_consts").val
