@@ -548,9 +548,13 @@ def optimize_old(e: Expr) -> Expr:
 def optimize(e: Expr) -> Expr:
     e = retuple(e, {})
     e = dce(e)
-    e = optimize_old(e)
+    e = to_anf(e, {})
+    e = inline_var_eq_var(e, {})
+    e = dce(e)
+
+    # e = optimize_old(e)
     # e = inline_trivial_letbody(e, {})
-    # e = inline_var_eq_var(e, {})
+    #
     # e = dce(e)
     # e = inline_var_eq_var(e, {})
     # e = dce(e)
@@ -581,7 +585,7 @@ def retuple(e, bindings):
     #         # let var0 = a[0] in g_tuple(args)
     #         #  ->  let vars = args in body
     #         return Let([Eqn(e.body.args, mkTuple(e.body.args))], e.body)
-    if iscall(e, "g_tuple"):
+    if iscall(e, "g_tuple") and len(e.args) > 0:
         # super-specific pattern, but common from AD and transformations
         # g_tuple(g_subscript(a, 0), g_subscript(a, 1)) -> mkTuple(a)
         args = [lookup(arg, bindings) for arg in e.args]
@@ -612,9 +616,9 @@ def retuple(e, bindings):
 def inline_var_eq_var(e, bindings):
     if e.isEqn:
         new_val = e.val
-        while new_val.isVar and new_val.name in bindings and bindings[new_val.name]:
+        while new_val.isVar and new_val in bindings and bindings[new_val]:
             # Inline the variable
-            new_val = bindings[new_val.name]
+            new_val = bindings[new_val]
 
         return Eqn(e.vars, new_val)
 

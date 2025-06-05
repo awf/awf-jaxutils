@@ -300,13 +300,14 @@ def foo4_forloop_list_append2(W1, b1, W2, b2, x):
     return softmax(sums * 1.0e-6)
 
 
+# TODO: getattr call mutates zs, harden getattrs
 def foo4_forloop_list_append3(W1, b1, W2, b2, x):
     t1 = W1 @ x + b1
     y1 = relu(t1)
-    y2 = W2.T @ W2 @ (y1 * t1)  # + b2
+    y2 = W2.T @ W2 @ (y1 * t1)
     zs = []
     for k in range(4):
-        zs.append(pow(y2, k) * 10**-k)  # TODO: getattr call mutates zs, harden getattrs
+        zs.append(pow(y2, k) * 10**-k)
     sums = sum(zs)
     return softmax(sums * 1.0e-6)
 
@@ -356,8 +357,8 @@ def annotate_expr_base(e: Expr) -> Expr:
     ],
 )
 def test_vjp(funcname, opt, ssa):
-    def pcode(e, fn):
-        code = expr_to_python_code(e, fn, flat_lets=False)
+    def pcode(e, fn, flat_lets=False):
+        code = expr_to_python_code(e, fn, flat_lets=flat_lets)
         print(code)
         return code
 
@@ -403,12 +404,13 @@ def test_vjp(funcname, opt, ssa):
     vjp = strip_annotations(vjp, {})
 
     print("\n\n*** VJP ***")
-    code = pcode(vjp, dfuncname)
+    for flat in ("flat", "indented"):
+        code = pcode(vjp, dfuncname, flat_lets=(flat == "flat"))
 
-    filename = f"tmp/test_vjp_tmp_{funcname}_{ssa}_{opt}.py"
-    with open(filename, "w") as f:
-        print(
-            """
+        filename = f"tmp/test_vjp_tmp_{funcname}_{ssa}_{opt}_{flat}.py"
+        with open(filename, "w") as f:
+            print(
+                """
 import jax
 from jaxutils.expr_lib import *
 
@@ -441,9 +443,9 @@ g_vjp_table |= {
     g_list_append: g_list_append_vjp,
 }
 """,
-            file=f,
-        )
-        print(code, file=f)
+                file=f,
+            )
+            print(code, file=f)
 
     mod = import_from_file(filename, "test_vjp_tmp")
 
