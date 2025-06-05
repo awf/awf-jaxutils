@@ -2,9 +2,10 @@ import types
 import sys
 import re
 import numpy as np
+from functools import lru_cache
 
 import jax
-import jaxlib.xla_extension as xla_ext
+
 import jax._src as jaxsrc
 from jax.extend import core as jaxcore
 from jax._src import source_info_util as jaxsi
@@ -38,12 +39,6 @@ def intercommavars(*xs):
     return ", ".join((varstr(x) for x in xs))
 
 
-def justone(iter):
-    l = list(iter)
-    assert len(l) == 1
-    return l[0]
-
-
 tab = "    "
 
 
@@ -59,7 +54,7 @@ def doc_from_source_line(source_info):
     return fnames[0]
 
 
-foo_num = 1000
+foo_num = 100
 
 
 def pythonize(name):
@@ -77,6 +72,11 @@ def new_name(base):
     return n
 
 
+@lru_cache
+def getname(x):
+    return new_name("v")
+
+
 def varstr(x):
     if isinstance(
         x,
@@ -92,7 +92,7 @@ def varstr(x):
         return str(x)
 
     if isinstance(x, jaxcore.Var):
-        return f"v{x.count}{x.suffix}_"
+        return getname(x)
 
     if isinstance(x, (jax.lax.GatherDimensionNumbers,)):
         return "GatherDimensionNumbers" + repr(x)
@@ -106,9 +106,8 @@ def varstr(x):
         return "int32"
 
     # This check just to ensure we have eyeballed all cases that need to be 'repr'ed
-    assert isinstance(
-        x, (str, bool, int, jax.lax.GatherDimensionNumbers)
-    ), f"Check this shouldn't be transformed [{repr(x)}]"
+    if not isinstance(x, (str, bool, int, dict, jax.lax.GatherDimensionNumbers)):
+        assert False, f"Check this shouldn't be transformed [{repr(x)}]"
 
     return repr(x)
 
@@ -191,11 +190,13 @@ def print_jaxpr_as_python(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             # Add val to new_params
             new_params[key] = val
 
-        if eqn.primitive is jaxsrc.pjit.pjit_p:
+        if False and eqn.primitive is jax.interpreters.xla.xla_call_p:
+            # TODO Handle xla_call specially - essentially erase it.  TODO: do we ever need to preserve the xla_call annotations?
+            callee = new_params["call_jaxpr"]
+            translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
 
-            # pjits are all of the form pjit(func_var, args).
-            # Emit as func_var(args)
-            # TODO: do we ever need to preserve the pjit annotations?
+        elif eqn.primitive is jaxsrc.pjit.pjit_p:
+            # TODO Handle pjit_p specially - essentially erase it.  TODO: do we ever need to preserve the pjit annotations?
             callee = new_params["jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
 
@@ -224,17 +225,6 @@ def print_jaxpr_as_python(f, jaxpr, *, indent="", doc="", file=sys.stdout):
 
 
 def get_primitive_name(eqn):
-    if eqn.primitive is lax.scatter_add_p:
-        return "scatter_add"
-
-    if eqn.primitive in (
-        lax.select_n_p,
-        lax.broadcast_in_dim_p,
-        lax.gather_p,
-        lax.reduce_sum_p,
-    ):
-        return eqn.primitive.name
-
     return eqn.primitive.name + "_p.bind"
 
 
@@ -370,8 +360,8 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
     assert False, f"Don't know how to simplify {jaxpr} of type {type(jaxpr)}"
 
 
-def show_jaxpr(
-    f, args, name=None, file=sys.stdout, add_decls=False, add_consts=True, **kwargs
+def old_show_jaxpr(
+    f, args, name=None, file=sys.stdout, add_decls=False, add_main=False, **kwargs
 ):
     """
     Show jaxpr f as if in python, i.e. "decompile" to python
@@ -382,8 +372,8 @@ def show_jaxpr(
     if add_decls:
         print(
             f"""
-#fmt: off
 # show_jaxpr {f}
+from numpy import float32,int32
 from jax.lax import *
 from jax.lax import transpose_p
 import jax.numpy as jnp
@@ -429,7 +419,7 @@ add_any_p = add_p
 
     print_jaxpr_as_python(name, closed_jaxpr.jaxpr, doc=doc, file=file)
 
-    if add_consts:
+    if add_main:
         print(
             f"""
 if __name__ == '__main__':
@@ -456,89 +446,5 @@ def show_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
 
 
 def show_jaxpr_and_xla(f, args, file=sys.stdout, optimized=False, **kwargs):
-    show_jaxpr(f, args, file=file, **kwargs)
+    old_show_jaxpr(f, args, file=file, **kwargs)
     show_xla(f, args, file=file, optimized=optimized, **kwargs)
-
-
-def test_basic():
-    def foo(p, x):
-        x = jax.numpy.matmul(x, p * x.T)
-        return (x + x[3]).std()
-
-    gradf = jax.grad(foo, argnums=1)
-    vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
-
-    f = vmapgradf
-
-    prng = jax.random.PRNGKey(42)
-    args = (2.2, jax.random.normal(prng, (3, 2, 5)))
-
-    print("f(args)=")
-    print(f(*args))
-
-    show_jaxpr(f, args, name="f")
-    # show_xla(f, args)
-    # show_xla(f, args, optimized=True)
-
-
-def test_roundtrip():
-    import os
-
-    def foo(p, x):
-        x = jax.numpy.matmul(x, p * x.T)
-        return (x + x[3]).std()
-
-    gradf = jax.grad(foo, argnums=1)
-    vmapgradf = jax.vmap(gradf, in_axes=(None, 2))
-
-    f = vmapgradf
-
-    prng = jax.random.PRNGKey(42)
-    args = (2.2, jax.random.normal(prng, (3, 2, 5)))
-
-    print("f(args)=")
-    print(f(*args))
-
-    # Save to file
-    fn = "tmp/show_jaxpr_jaxpr.py"
-    with open(fn, "w") as file:
-        show_jaxpr(f, args, name="f", file=file, add_decls=True)
-
-    os.system(f"black {fn}")
-
-    # Load from file
-    import importlib.util
-
-    module_name = "show_jaxpr_roundtrip"
-    spec = importlib.util.spec_from_file_location(module_name, fn)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-
-    # Check rountrip: does module.f give the same result?
-    assert jnp.allclose(module.f(*args), f(*args))
-
-    # Save again
-    fn2 = "tmp/show_jaxpr_roundtrip.py"
-    with open(fn2, "w") as file2:
-        show_jaxpr(module.f, args, file=file2, add_decls=True)
-
-    os.system(f"black {fn2}")
-
-    # Reload for 2nd roundtrip to test string equality
-    module_name = "show_jaxpr_roundtrip2"
-    spec = importlib.util.spec_from_file_location(module_name, fn2)
-    module2 = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module2
-    spec.loader.exec_module(module2)
-
-    assert jnp.allclose(module.f(*args), f(*args))
-
-    # Sand save 2nd roundtrip
-    fn3 = "tmp/show_jaxpr_roundtrip2.py"
-    with open(fn3, "w") as file3:
-        show_jaxpr(module2.f, args, file=file3, add_decls=True)
-
-    os.system(f"black {fn3}")
-
-    print(f"code --diff {fn2} {fn3} # Do view diffs in vs code")

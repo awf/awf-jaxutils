@@ -1,7 +1,10 @@
 {
-  "python.testing.pytestArgs": [
-    "."
-  ],
   "python.testing.unittestEnabled": false,
-  "python.testing.pytestEnabled": true
+  "python.testing.pytestEnabled": true,
+  "editor.formatOnSave": true,
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter"
+  },
+  "jupyter.interactiveWindow.textEditor.cellFolding": true,
+  "jupyter.debugJustMyCode": false
 }

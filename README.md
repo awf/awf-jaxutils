@@ -64,7 +64,7 @@ def my_init() -> ParamsDict:
 
 # Show JAXPR
 
-A 'decompiler' for jaxprs back into python
+A 'decompiler' for jaxprs back into python.  Here's a python function (from `test_emit_readme`):
 ```python
 def ffn(W, x):
     ((W1,b1),(W2,b2)) = W
@@ -73,64 +73,31 @@ def ffn(W, x):
     y2 = W2 @ y1 + b2
     return jnn.softmax(y2)
 ```
-And the JAXPR, not super pretty, but perhaps more readable than the XLA, at least for python programmers
+And the output from `show_jaxpr(ffn, args)`, not super pretty, but 
+considerably more so than the jaxpr itself, or the XLA.
+We can see, for example, that the softmax
+primitive has been inlined into the jaxpr, having performed
+the typical `log(sum(exp(x - max(x))))` transformation.
 ```python
-# show_jaxpr | black
-def ffn(
-    a_: ShapedArray((11, 7), float32, False, {}),
-    b_: ShapedArray((11,), float32, False, {}),
-    c_: ShapedArray((10, 11), float32, False, {}),
-    d_: ShapedArray((10,), float32, False, {}),
-    e_: ShapedArray((7,), float32, False, {}),
-):
-    f_ = dot_general(
-        a_,
-        e_,
-        dimension_numbers=(((1,), (0,)), ((), ())),
-        precision=None,
-        preferred_element_type=None,
-    )
-    g_ = add(f_, b_)
+def ffn(v01, v02, v03, v04, v05):
+    v06 = v01 @ v05
+    v07 = v06 + v02
 
-    def custom_jvp_call_jaxpr1000(a_: ShapedArray((11,), float32, False, {})):
-        """/tmp/ipykernel_10736/3248565795.py:7:ffn"""
-
-        def xla_call1001(a_: ShapedArray((11,), float32, False, {})):
-            """/tmp/ipykernel_10736/3248565795.py:7:ffn"""
-            b_ = max(a_, 0.0)
-            return b_
-
-        b_ = xla_call(xla_call1001)(
-            a_,
-            device=None,
-            backend=None,
-            name="relu",
-            donated_invars=(False,),
-            inline=False,
-            keep_unused=False,
-        )
-        return b_
-
-    h_ = custom_jvp_call_jaxpr(custom_jvp_call_jaxpr1000)(
-        g_, jvp_jaxpr_thunk=jax.interpreters.partial_eval.memoized, num_consts=0
-    )
-    i_ = dot_general(
-        c_,
-        h_,
-        dimension_numbers=(((1,), (0,)), ((), ())),
-        precision=None,
-        preferred_element_type=None,
-    )
-    j_ = add(i_, d_)
-    k_ = reduce_max(j_, axes=(0,))
-    l_ = broadcast_in_dim(k_, shape=(1,), broadcast_dimensions=())
-    m_ = stop_gradient(l_)
-    n_ = sub(j_, m_)
-    o_ = exp(n_)
-    p_ = reduce_sum(o_, axes=(0,))
-    q_ = broadcast_in_dim(p_, shape=(1,), broadcast_dimensions=())
-    r_ = div(o_, q_)
-    return r_
+    def pjit_relu_0(v09):
+        return lax.max(v09, np.array(0.0, dtype=np.float32))
+    v0c = pjit_relu_0(v07)
+    v0d = v03 @ v0c
+    v0e = v0d + v04
+    v0f = reduce_max_p.bind(v0e, axes=(0,))
+    v10 = lax.max(np.array(-inf, dtype=np.float32), v0f)
+    v11 = lax.broadcast_in_dim(v10, (1,), (), out_sharding=None)
+    v12 = lax.stop_gradient(v11)
+    v13 = v0e - v12
+    v14 = lax.exp(v13, accuracy=None)
+    v15 = reduce_sum_p.bind(v14, axes=(0,))
+    v16 = lax.broadcast_in_dim(v15, (1,), (), out_sharding=None)
+    v17 = v14 / v16
+    return v17
 ```
 
 # VJP: Vector-Jacobian Products
