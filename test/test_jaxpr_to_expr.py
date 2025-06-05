@@ -80,7 +80,7 @@ def test_roundtrip(n):
     print(f(*args))
 
     def save(f, args, name, fn):
-        jaxutils.expr.reset_new_name_ids()
+        puca.expr.reset_new_name_ids()
 
         with open(fn, "w") as file:
             show_jaxpr(f, args, name=name, file=file, add_decls=True)

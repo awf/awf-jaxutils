@@ -20,14 +20,14 @@ from jax.extend.core import primitives as jaxprim
 from pprint import pprint
 
 import jaxutils
-import jaxutils.expr as jex
-from jaxutils.expr import Expr, Var, Const, Lambda, Eqn, Let, Call
-from jaxutils.expr_ast import kwargs_to_dict_call
-from jaxutils.expr import dictassign
+import puca.expr as jex
+from puca.expr import Expr, Var, Const, Lambda, Eqn, Let, Call
+from puca.expr_ast import kwargs_to_dict_call
+from puca.expr import dictassign
 
 import ast
 
-import jaxutils.expr_eval
+import puca.expr_eval
 
 if sys.version_info >= (3, 9):
     unparse = ast.unparse
@@ -313,7 +313,7 @@ def jaxpr_to_expr(jaxpr) -> Lambda:
             val = _prim_to_expr[eqn.primitive](*eqn_args, **new_params)
 
         if val is None:
-            params = jaxutils.expr_ast.kwargs_to_dict_call(new_params)
+            params = puca.expr_ast.kwargs_to_dict_call(new_params)
             val = Call(Var(eqn.primitive.name + "_p.bind"), eqn_args + params)
 
         vars = map(jaxpr_to_expr_aux, eqn.outvars)
@@ -425,7 +425,7 @@ def show_jaxpr(
     if optimize:
         e = jex.optimize(e)
 
-    as_ast = jaxutils.expr_ast.to_ast(e, name)
+    as_ast = puca.expr_ast.to_ast(e, name)
     body_code = unparse(as_ast)
 
     fvs = list(v.name for v in jex.freevars(e))
@@ -448,7 +448,7 @@ from jax.extend.core.primitives import (
    add_jaxvals_p
 )
 
-from jaxutils.expr_lib import *
+from puca.g_lib import *
 """,
             file=file,
         )
