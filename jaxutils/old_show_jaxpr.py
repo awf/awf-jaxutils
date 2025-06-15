@@ -360,7 +360,7 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
     assert False, f"Don't know how to simplify {jaxpr} of type {type(jaxpr)}"
 
 
-def old_show_jaxpr(
+def show_jaxpr(
     f, args, name=None, file=sys.stdout, add_decls=False, add_main=False, **kwargs
 ):
     """

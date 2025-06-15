@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jaxutils.jaxpr_to_expr import show_jaxpr
+from jaxutils.old_show_jaxpr import show_jaxpr
 
 
 def ffn(W, x):

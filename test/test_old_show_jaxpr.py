@@ -1,7 +1,8 @@
 import pytest
 import sys
 import jax
-from jaxutils.old_show_jaxpr import old_show_jaxpr
+import numpy as np
+from jaxutils.old_show_jaxpr import show_jaxpr
 
 
 def test_basic():
@@ -20,12 +21,12 @@ def test_basic():
     print("f(args)=")
     print(f(*args))
 
-    old_show_jaxpr(f, args, name="f")
+    show_jaxpr(f, args, name="f")
     # show_xla(f, args)
     # show_xla(f, args, optimized=True)
 
 
-@pytest.mark.skip(reason="deprecating old_show_jaxpr")
+@pytest.mark.skip(reason="deprecating show_jaxpr")
 def test_roundtrip():
     import os
     from awfutils import import_from_file
@@ -48,7 +49,7 @@ def test_roundtrip():
     # Save to file
     fn = "tmp/show_jaxpr_jaxpr.py"
     with open(fn, "w") as file:
-        old_show_jaxpr(f, args, name="f", file=file, add_decls=True)
+        show_jaxpr(f, args, name="f", file=file, add_decls=True)
 
     os.system(f"black {fn}")
 
@@ -56,13 +57,13 @@ def test_roundtrip():
 
     module = import_from_file(fn, "show_jaxpr_roundtrip")
 
-    # Check rountrip: does module.f give the same result?
-    assert jnp.allclose(module.f(*args), f(*args))
+    # Check roundtrip: does module.f give the same result?
+    np.testing.assert_allclose(module.f(*args), f(*args))
 
     # Save again
     fn2 = "tmp/show_jaxpr_roundtrip.py"
     with open(fn2, "w") as file2:
-        old_show_jaxpr(module.f, args, file=file2, add_decls=True)
+        show_jaxpr(module.f, args, file=file2, add_decls=True)
 
     os.system(f"black {fn2}")
 
@@ -74,7 +75,7 @@ def test_roundtrip():
     # Sand save 2nd roundtrip
     fn3 = "tmp/show_jaxpr_roundtrip2.py"
     with open(fn3, "w") as file3:
-        old_show_jaxpr(module2.f, args, file=file3, add_decls=True)
+        show_jaxpr(module2.f, args, file=file3, add_decls=True)
 
     os.system(f"black {fn3}")
 
