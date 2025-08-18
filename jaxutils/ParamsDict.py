@@ -15,9 +15,7 @@ class ParamsDict(types.SimpleNamespace):
         super().__init__(**kwargs)
 
     def tree_flatten(self):
-        return jax.tree.flatten(
-            self.__dict__, lambda a: a is not self.__dict__
-        )  # only flatten one step
+        return jax.tree.flatten(self.__dict__)
 
     @classmethod
     def tree_unflatten(cls, aux, values):
@@ -47,8 +45,11 @@ class ParamsDict(types.SimpleNamespace):
         else:
             yield (path, obj)
 
-    def items(self, path=""):
+    def all_items(self, path=""):
         yield from self.labels_aux(path, self)
+
+    def items(self):
+        return self.__dict__.items()
 
 
 if __name__ == "__main__":
