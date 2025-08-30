@@ -4,6 +4,21 @@ import jax
 
 import numbers
 
+## Make SimpleNamespace a pytree node
+from types import SimpleNamespace
+
+
+def sns_tree_flatten(sns):
+    return jax.tree.flatten(sns.__dict__)
+
+
+def sns_tree_unflatten(aux, values):
+    return SimpleNamespace(**jax.tree.unflatten(aux, values))
+
+
+def pytree_register_simple_namespace():
+    jax.tree_util.register_pytree_node(SimpleNamespace, sns_tree_flatten, sns_tree_unflatten)
+
 
 def is_simple_type(x):
     return isinstance(x, (numbers.Number, bool, str))
