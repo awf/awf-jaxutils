@@ -132,11 +132,11 @@ def prim_as_python_scatter_add_p(
     out_sharding="None",
 ):
     ignores = ""
-    if update_jaxpr is not "None":
+    if update_jaxpr != "None":
         ignores += f", update_jaxpr={update_jaxpr}"
-    if update_consts is not "()":
+    if update_consts != "()":
         ignores += f", update_consts={update_consts}"
-    if out_sharding is not "None":
+    if out_sharding != "None":
         ignores += f", out_sharding={out_sharding}"
     if ignores:
         ignores = " # ignoring: " + ignores[2:] + "\n"
@@ -164,9 +164,7 @@ import jax.numpy as jnp
 from icecream import ic
 
 prim_as_python_map = {
-    lax.log_p: lambda x, accuracy=None: (
-        f"jnp.log({x})" if accuracy is None else f"jnp.log({x}, {accuracy=})"
-    ),
+    lax.log_p: lambda x, accuracy=None: (f"jnp.log({x})" if accuracy is None else f"jnp.log({x}, {accuracy=})"),
     lax.lt_p: lambda x, y: f"{x} < {y}",
     lax.add_p: lambda x, y: f"{x} + {y}",
     lax.mul_p: lambda x, y: f"{x} * {y}",
@@ -289,13 +287,9 @@ def inline_jaxpr(eqn, new_eqn_invars, new_eqn_outvars, var_mapping):
     print(f"Inlining jaxpr {eqn}")
 
     # rename variables in the callee
-    invars_mapping = {
-        inner: value for inner, value in zip(callee.invars, new_eqn_invars)
-    }
+    invars_mapping = {inner: value for inner, value in zip(callee.invars, new_eqn_invars)}
     outvars_mapping = {
-        inner: here
-        for inner, here in zip(callee.outvars, new_eqn_outvars)
-        if inner not in invars_mapping
+        inner: here for inner, here in zip(callee.outvars, new_eqn_outvars) if inner not in invars_mapping
     }
 
     for aliased_outvar, new_eqn_outvar in zip(callee.outvars, new_eqn_outvars):
@@ -348,9 +342,7 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
             new_eqn_outvars = [new_var(v) for v in eqn.outvars]
 
             # inline the "direct call" primitives pjit and custom_jvp_call
-            inlined_eqns = inline_jaxpr(
-                eqn, new_eqn_invars, new_eqn_outvars, var_mapping
-            )
+            inlined_eqns = inline_jaxpr(eqn, new_eqn_invars, new_eqn_outvars, var_mapping)
             if inlined_eqns is not None:
                 return inlined_eqns
 
@@ -362,9 +354,7 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
 
             new_params = {k: new_param(param) for k, param in eqn.params.items()}
 
-            new_source_info = jaxsi.SourceInfo(
-                eqn.source_info.traceback, eqn.source_info.name_stack.extend("simplify")
-            )
+            new_source_info = jaxsi.SourceInfo(eqn.source_info.traceback, eqn.source_info.name_stack.extend("simplify"))
 
             new_eqn = jaxcore.JaxprEqn(
                 new_eqn_invars,
@@ -394,9 +384,7 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
     assert False, f"Don't know how to simplify {jaxpr} of type {type(jaxpr)}"
 
 
-def show_jaxpr(
-    f, args, name=None, file=sys.stdout, add_decls=False, add_main=False, **kwargs
-):
+def show_jaxpr(f, args, name=None, file=sys.stdout, add_decls=False, add_main=False, **kwargs):
     """
     Show jaxpr f as if in python, i.e. "decompile" to python
     """
