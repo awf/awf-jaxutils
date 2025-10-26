@@ -29,3 +29,6 @@ def test_emit_readme():
     show_jaxpr(ffn, (W, x))
 
     show_jaxpr(jax.grad(loss), (W, x))
+
+    # Check output matches README
+    pass

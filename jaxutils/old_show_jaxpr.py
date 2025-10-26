@@ -195,7 +195,7 @@ def print_jaxpr_as_python(f, jaxpr, *, indent="", doc="", file=sys.stdout):
             callee = new_params["call_jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
 
-        elif eqn.primitive is jaxsrc.pjit.pjit_p:
+        elif eqn.primitive is jaxcore.primitives.jit_p:
             # TODO Handle pjit_p specially - essentially erase it.  TODO: do we ever need to preserve the pjit annotations?
             callee = new_params["jaxpr"]
             translation = f"{callee}({intercommavars(*eqn.invars)}) # {new_params}"
@@ -229,9 +229,12 @@ def get_primitive_name(eqn):
 
 
 def inline_jaxpr(eqn, new_eqn_invars, new_eqn_outvars, var_mapping):
+    if not any("jaxpr" in k for k in eqn.params):
+        return None
+
     if eqn.primitive not in (
-        jaxsrc.pjit.pjit_p,
-        # jaxsrc.custom_derivatives.custom_jvp_call_p,
+        jaxcore.primitives.jit_p,
+        jaxcore.primitives.custom_jvp_call_p,
     ):
         return None
 
@@ -244,9 +247,9 @@ def inline_jaxpr(eqn, new_eqn_invars, new_eqn_outvars, var_mapping):
     #   new_os[1] = bar(new_is[0], new_is[1])
     #   new_os[0] = bar(new_os[1], new_is[1])
 
-    if eqn.primitive is jaxsrc.pjit.pjit_p:
+    if eqn.primitive is jaxcore.primitives.jit_p:
         callee = eqn.params["jaxpr"].jaxpr
-    elif eqn.primitive is jaxsrc.custom_derivatives.custom_jvp_call_p:
+    elif eqn.primitive is jaxcore.primitives.custom_jvp_call_p:
         callee = eqn.params["call_jaxpr"].jaxpr
 
     if len(callee.eqns) > 0:
@@ -296,7 +299,7 @@ def simplify_jaxpr(jaxpr, var_mapping=None, deep=True):
             if v in var_mapping:
                 return var_mapping[v]
             else:
-                vnew = jaxcore.Var(v.suffix, v.aval)
+                vnew = jaxcore.Var(v.aval, v.initial_qdd, v.final_qdd)
                 var_mapping[v] = vnew
                 return vnew
 
