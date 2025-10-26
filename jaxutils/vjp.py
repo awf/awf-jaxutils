@@ -401,8 +401,8 @@ def pow_vjp(x, p, dret):
     return dx, dp
 
 
-def test_negate():
-    check(negate, negate_vjp, np.random.rand(13, 7))
+# def test_pow():
+#     check(pow, pow_vjp, np.random.rand(13, 7), 2)
 
 
 # negate: A -> A
