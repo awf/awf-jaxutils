@@ -1,3 +1,5 @@
 [submodule "awfutils"]
 	path = awfutils
 	url = https://github.com/awf/awfutils
+[submodule "awfutils/"]
+	branch = puca
